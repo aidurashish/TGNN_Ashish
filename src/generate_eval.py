@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 from utils import generate_new_batches, read_datasets
-from src.models import ATMGNN, ATMGNN_Diff
+from models import ATMGNN, ATMGNN_Diff
 import warnings
 
 # === FUNCTION ===
@@ -81,6 +81,7 @@ if __name__ == '__main__':
     parser.add_argument('--sep', type=int, default=10, help='Seperator for validation and train set.')
     parser.add_argument('--eval-start', type=int, default=7, help='Start day offset for evaluation on new data.')
     parser.add_argument('--rand-weights', type=bool, default=False, help="True or False. Enable ablation where weights in the adjacency matrix are shuffled.")
+    parser.add_argument('--rand-seed', type=int, default=0, help="Specify the random seed used during training (must match the trained checkpoint).")
     parser.add_argument('--model-name', type=str, default='ATMGNN_Diff', choices=['ATMGNN', 'ATMGNN_Diff'], help='Model architecture to evaluate (must match trained checkpoint).')
     parser.add_argument('--diffusion-steps', type=int, default=8, help='Number of DDPM denoising steps T (only used with ATMGNN_Diff).')
     parser.add_argument('--num-samples', type=int, default=50, help='Number of diffusion samples at inference for uncertainty estimation.')
@@ -89,9 +90,21 @@ if __name__ == '__main__':
     
     # Use GPU if available, otherwise fall back to CPU.
     device = torch.device("cuda" if torch.cuda.is_available() else torch.device("cpu"))
-    
+    print("\n" + "="*60)
+    print("  TGNN Evaluation Run")
+    print("="*60)
+    print("  Device      : {}".format(device))
+    print("  Models      : ATMGNN, ATMGNN_Diff")
+    print("  Countries   : IT, ES, EN, FR")
+    print("  Shifts      : 0 to {}".format(args.ahead - 1))
+    print("  Eval start  : day {}".format(args.eval_start))
+    print("  Rand seed   : {}".format(args.rand_seed))
+    print("="*60 + "\n")
+
+    print("[SETUP] Loading datasets...")
     # Load graphs, features, labels, and targets for all four countries at once.
     meta_labs, meta_graphs, meta_features, meta_y = read_datasets(args.window)
+    print("[SETUP] Datasets loaded.\n")
 
     # Iterate over each country dataset in order.
     for country in ["IT", "ES", "EN", "FR"]:
@@ -117,7 +130,9 @@ if __name__ == '__main__':
         nfeat = meta_features[idx][0].shape[1]  # number of input features per node
         
         n_nodes = gs_adj[0].shape[0]
-        print(n_nodes)
+        print("\n" + "-"*60)
+        print("  Country: {}  |  Nodes: {}  |  Days available: {}".format(country, n_nodes, n_samples))
+        print("-"*60)
         
         # Create output directories if they don't exist yet.
         if not os.path.exists('../results'):
@@ -126,7 +141,8 @@ if __name__ == '__main__':
             os.makedirs('../eval')
 
 
-        for args.model in [args.model_name]:   # Selects model architecture via --model-name arg
+        for args.model in ['ATMGNN', 'ATMGNN_Diff']:   # Evaluates both models sequentially in one run
+            print("\n[MODEL] Evaluating: {} on {}".format(args.model, country))
             # Pre-allocate matrices to collect predictions and ground-truth for all shifts at once.
             prediction_set = np.empty((args.ahead, n_nodes), np.float64)
             truth_set = np.empty((args.ahead, n_nodes), np.float64)
@@ -139,7 +155,7 @@ if __name__ == '__main__':
                 y_pred = np.empty((n_nodes, 0), dtype=int)
                 y_true = np.empty((n_nodes, 0), dtype=int)
 
-                print("Evaluating {} at shift {}...".format(args.model, shift))
+                print("  [SHIFT {}/{}] Loading checkpoint and running inference...".format(shift + 1, args.ahead), end=" ", flush=True)
 
                 # === INITIALIZATION ===
                 
@@ -154,7 +170,7 @@ if __name__ == '__main__':
                 
                 # Run inference using the best checkpoint for this (country, shift) pair.
                 n_eval_samples = args.num_samples if args.model == "ATMGNN_Diff" else 1
-                o, l, u = output_val(gs_adj, features, y, model, '../Checkpoints/model_best_{}_shift{}_{}.pth.tar'.format(args.model, shift, country), shift, n_samples=n_eval_samples)
+                o, l, u = output_val(gs_adj, features, y, model, '../Checkpoints/model_best_{}_shift{}_{}_RW_{}_seed{}_AG.pth.tar'.format(args.model, shift, country, args.rand_weights, args.rand_seed), shift, n_samples=n_eval_samples)
                 
                 # Store this shift's results in the pre-allocated matrices.
                 prediction_set[shift] = o
@@ -162,8 +178,12 @@ if __name__ == '__main__':
                 if uncertainty_set is not None and u is not None:
                     uncertainty_set[shift] = u
                 
+                mae = np.mean(np.abs(o - l))
+                print("MAE={:.5f}".format(mae))
+
                 # Save per-shift predictions and ground-truth as individual CSV files.
                 np.savetxt("../eval/predict_{}_shift{}_{}.csv".format(args.model, shift, country), o.reshape(1, -1), fmt="%.5f", delimiter=',')
                 np.savetxt("../eval/truth_{}_shift{}_{}.csv".format(args.model, shift, country), l.reshape(1, -1), fmt="%.5f", delimiter=',')
                 if u is not None:
                     np.savetxt("../eval/uncertainty_{}_shift{}_{}.csv".format(args.model, shift, country), u.reshape(1, -1), fmt="%.5f", delimiter=',')
+            print("  Results saved to ../eval/")

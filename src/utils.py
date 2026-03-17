@@ -112,14 +112,14 @@ def read_datasets(window, rand_weight=False):
             final_targets    (list): Lists of target case counts (one list per day) per country.
     """
     
-    os.chdir("../data")
+    os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../data"))
     final_labels = []
     final_graphs = []
     final_features = []
     final_targets = []
 
     # Italy
-    os.chdir("Italy")
+    os.chdir("Italy [COVID-19]")
     labels = pd.read_csv("italy_labels.csv")
     del labels["id"]
     labels = labels.set_index("name")   # rows = regions, columns = dates
@@ -159,7 +159,7 @@ def read_datasets(window, rand_weight=False):
     final_targets.append(y)
 
     # Spain
-    os.chdir("../Spain")
+    os.chdir("../Spain [COVID-19]")
     labels = pd.read_csv("spain_labels.csv")
     labels = labels.set_index("name")
 
@@ -193,7 +193,7 @@ def read_datasets(window, rand_weight=False):
     final_targets.append(y)
 
     # Great Britain
-    os.chdir("../England")
+    os.chdir("../England [COVID-19]")
     labels = pd.read_csv("england_labels.csv")
     labels = labels.set_index("name")
 
@@ -225,7 +225,7 @@ def read_datasets(window, rand_weight=False):
     final_targets.append(y)
 
     # France
-    os.chdir("../France")
+    os.chdir("../France [COVID-19]")
     labels = pd.read_csv("france_labels.csv")
     labels = labels.set_index("name")
 
@@ -259,7 +259,7 @@ def read_datasets(window, rand_weight=False):
     final_targets.append(y)
     
     # Return to the source code directory after reading all data files.
-    os.chdir("../../code")
+    os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__))))
 
     return final_labels, final_graphs, final_features, final_targets
     
@@ -444,7 +444,7 @@ def sparse_matrix_to_torch_sparse_tensor(sparse_mx):
         np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
     values = torch.from_numpy(sparse_mx.data)
     shape = torch.Size(sparse_mx.shape)
-    return torch.sparse.FloatTensor(indices, values, shape)
+    return torch.sparse_coo_tensor(indices, values, shape)
 
 # === CLASS DEFINITION === 
 

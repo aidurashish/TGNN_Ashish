@@ -20,7 +20,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from math import ceil
 from utils import generate_new_batches, AverageMeter, read_datasets
-from src.models import ATMGNN, ATMGNN_Diff
+from models import ATMGNN, ATMGNN_Diff
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # === FUNCTIONS === 
@@ -50,6 +50,10 @@ def train(adj, features, y):
         # Diffusion training: epsilon-prediction loss on encoder conditioning.
         loss_train = model.compute_diffusion_loss(adj, features, y)
         loss_train.backward(retain_graph=True)
+        for p in model.parameters():
+            if p.grad is not None:
+                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
         # Return target as size placeholder
@@ -62,6 +66,10 @@ def train(adj, features, y):
         seir_penalty = F.relu(-output).mean()
         loss_train = loss_mse + SEIR_LAMBDA * seir_penalty
         loss_train.backward(retain_graph=True)
+        for p in model.parameters():
+            if p.grad is not None:
+                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
     return output, loss_train
@@ -116,9 +124,21 @@ if __name__ == '__main__':
     
     # Use GPU if available, otherwise fall back to CPU.
     device = torch.device("cuda" if torch.cuda.is_available() else torch.device("cpu"))
-    
+    print("\n" + "="*60)
+    print("  TGNN Training Run")
+    print("="*60)
+    print("  Device      : {}".format(device))
+    print("  Models      : ATMGNN, ATMGNN_Diff")
+    print("  Countries   : IT, ES, EN, FR")
+    print("  Shifts      : 0 to {}".format(args.ahead - 1))
+    print("  Epochs      : {} (early stop after {})".format(args.epochs, args.early_stop))
+    print("  Rand seed   : {}".format(args.rand_seed))
+    print("="*60 + "\n")
+
+    print("[SETUP] Loading datasets...")
     # Load graphs, features, labels, and targets for all four countries at once.
     meta_labs, meta_graphs, meta_features, meta_y = read_datasets(args.window, args.rand_weights)
+    print("[SETUP] Datasets loaded.\n")
     
     # Iterate over each country dataset in order
     for country in ["IT", "ES", "EN", "FR"]:
@@ -144,8 +164,10 @@ if __name__ == '__main__':
         nfeat = meta_features[idx][0].shape[1]  # number of input features per node
         
         n_nodes = gs_adj[0].shape[0]
-        print(n_nodes)
-        
+        print("\n" + "-"*60)
+        print("  Country: {}  |  Nodes: {}  |  Days available: {}".format(country, n_nodes, n_samples))
+        print("-"*60)
+
         # Create output directories if they don't exist yet.
         if not os.path.exists('../results'):
             os.makedirs('../results')
@@ -155,9 +177,11 @@ if __name__ == '__main__':
             os.makedirs('../Predictions')
 
         
-        for args.model in [args.model_name]:   # Selects model architecture via --model-name arg
-			# Predicts 0, 1, ..., 'ahead' - 1 days into the future.
+        for args.model in ['ATMGNN', 'ATMGNN_Diff']:   # Trains both models sequentially in one run
+            print("\n[MODEL] Starting training: {} on {}".format(args.model, country))
+            # Predicts 0, 1, ..., 'ahead' - 1 days into the future.
             for shift in list(range(0,args.ahead)):
+                print("\n  [SHIFT {}/{}] Model={} Country={}".format(shift + 1, args.ahead, args.model, country))
 
                 result = []                                 # stores mean absolute error (MAE) per test day
                 y_pred = np.empty((n_nodes, 0), dtype=int)  # accumulates predictions column by column
@@ -167,10 +191,12 @@ if __name__ == '__main__':
                 exp = 0
                 fw = open("../results/results_"+country+"_temporal.csv","a")
 
+                n_test_days = n_samples - shift - args.start_exp
+                print("    Rolling window: {} test days ({} to {})".format(n_test_days, args.start_exp, n_samples - shift - 1))
                 # Rolling-window loop where each iteration moves the test day one step forward.
                 for test_sample in range(args.start_exp,n_samples-shift):
                     exp+=1
-                    print(test_sample)
+                    print("    [Day {}/{} | test_sample={}]".format(exp, n_test_days, test_sample), end=" ", flush=True)
 
                     # === DATA SPLITTING ===
                     # Training indices: all days from the start up to 'sep' days before the test day.
@@ -234,21 +260,28 @@ if __name__ == '__main__':
 
                             # Print results
                             if(epoch%50==0):
-                                print("Epoch:", '%03d' % (epoch + 1), "train_loss=", "{:.5f}".format(train_loss.avg),"val_loss=", "{:.5f}".format(val_loss), "time=", "{:.5f}".format(time.time() - start))
+                                print("\n      Epoch {:03d}/{:d}  train_loss={:.5f}  val_loss={:.5f}  time={:.3f}s".format(
+                                    epoch + 1, args.epochs, train_loss.avg, val_loss, time.time() - start), end="", flush=True)
 
                             train_among_epochs.append(train_loss.avg)
                             val_among_epochs.append(val_loss)
 
+                            # If val_loss is NaN, training has diverged => restart with a fresh model.
+                            if val_loss != val_loss:  # NaN check
+                                print("\n    [WARN] NaN val_loss at epoch {} => restarting with fresh model.".format(epoch + 1))
+                                stop = False
+                                break
+
                             # Early-stop if validation loss hasn't changed in the last 20 epochs (training stalled).
                             if(epoch<30 and epoch>10):
-                                if(len(set([round(val_e) for val_e in val_among_epochs[-20:]])) == 1 ):
+                                if(len(set([round(val_e, -1) for val_e in val_among_epochs[-20:]])) == 1 ):
                                     stop = False
                                     break
 
                             # Early-stop if validaion loss hasn't changed in the last 50 epochs (fully converged).
                             if( epoch>args.early_stop):
-                                if(len(set([round(val_e) for val_e in val_among_epochs[-50:]])) == 1):
-                                    print("training has ended.")
+                                if(len(set([round(val_e, -1) for val_e in val_among_epochs[-50:]])) == 1):
+                                    print("\n      [EARLY STOP] Converged at epoch {}.".format(epoch + 1))
                                     break
 
                             stop = True
@@ -265,8 +298,6 @@ if __name__ == '__main__':
                             scheduler.step(val_loss)
 
 
-                    print("validation") 
-                    
                     # === TESTING ===
                     
                     test_loss = AverageMeter()
@@ -292,9 +323,9 @@ if __name__ == '__main__':
                     
                     # Mean absolute error (MAE) averaged over all regions for this test day.
                     error = np.sum(abs(o-l))/n_nodes
-                    print("Shape of error: {}".format(o.shape))
+                    print("\nShape of error: {}".format(o.shape))
 			
-                    print("test error=", "{:.5f}".format(error))
+                    print("Test error=", "{:.5f}".format(error))
                     result.append(error)
                     
                     # Append this day's predictions and ground-truth as a new column.
@@ -306,13 +337,19 @@ if __name__ == '__main__':
                         y_uncert = np.append(y_uncert, uncertainty.cpu().numpy().reshape(-1,1), axis=1)
 
                 # Print summary metrics across all test days for this (country, shift) pair.
-                print("{:.5f}".format(np.mean(result))+",{:.5f}".format(np.std(result))+",{:.5f}".format(  np.sum(labels.iloc[:,args.start_exp:test_sample].mean(1))))
-                print("Aux metrics: {:.5f}".format(mean_absolute_error(y_true, y_pred))+",{:.5f}".format(mean_squared_error(y_true, y_pred))+",{:.5f}".format(mean_squared_error(y_true, y_pred, squared=False))+",{:.5f}".format(r2_score(y_true, y_pred)))
+                print("\n  [SHIFT {} SUMMARY] Model={} Country={}".format(shift, args.model, country))
+                print("    MAE={:.5f}  std={:.5f}  MSE={:.5f}  RMSE={:.5f}  R2={:.5f}".format(
+                    mean_absolute_error(y_true, y_pred),
+                    np.std(result),
+                    mean_squared_error(y_true, y_pred),
+                    np.sqrt(mean_squared_error(y_true, y_pred)),
+                    r2_score(y_true, y_pred)))
 
                 # Write metrics to CSV and save raw prediction/truth arrays to disk.
-                fw.write(str(args.model)+"_AGW_MMR_"+str(args.rand_weights)+","+str(shift)+",{:.5f}".format(np.mean(result))+",{:.5f}".format(np.std(result))+",{:.5f}".format(mean_absolute_error(y_true, y_pred))+",{:.5f}".format(mean_squared_error(y_true, y_pred))+",{:.5f}".format(mean_squared_error(y_true, y_pred, squared=False))+",{:.5f}".format(r2_score(y_true, y_pred))+"\n")
+                fw.write(str(args.model)+"_AGW_MMR_"+str(args.rand_weights)+","+str(shift)+",{:.5f}".format(np.mean(result))+",{:.5f}".format(np.std(result))+",{:.5f}".format(mean_absolute_error(y_true, y_pred))+",{:.5f}".format(mean_squared_error(y_true, y_pred))+",{:.5f}".format(np.sqrt(mean_squared_error(y_true, y_pred)))+",{:.5f}".format(r2_score(y_true, y_pred))+"\n")
                 fw.close()
                 np.savetxt("../Predictions/predict_{}_shift{}_{}.csv".format(args.model, shift, country), y_pred, fmt="%.5f", delimiter=',')
                 np.savetxt("../Predictions/truth_{}_shift{}_{}.csv".format(args.model, shift, country), y_true, fmt="%.5f", delimiter=',')
                 if y_uncert.shape[1] > 0:
                     np.savetxt("../Predictions/uncertainty_{}_shift{}_{}.csv".format(args.model, shift, country), y_uncert, fmt="%.5f", delimiter=',')
+                print("    Predictions saved to ../Predictions/")
