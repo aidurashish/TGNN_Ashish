@@ -1,0 +1,14 @@
+# Deep learning modules
+torch
+torch-geometric
+
+# Graph processing modules
+networkx
+
+# Numerical and scientific computing modules
+numpy
+scipy
+pandas
+
+# Machine learning (ML) modules
+scikit-learn

@@ -1,0 +1,475 @@
+"""
+    Core functions for loading, preprocessing, and batching data used to train the model.
+"""
+
+# === IMPORTS === 
+
+import torch
+import networkx as nx
+import numpy as np
+import scipy.sparse as sp
+import pandas as pd
+from datetime import date, timedelta
+import os
+from scipy.integrate import odeint
+from scipy.optimize import minimize
+
+# === FUNCTIONS === 
+
+# Fixed COVID-19 mean incubation period (days) which is held constant to reduce fitting complexity.
+# σ = 1.0 / Mean incuabtion period (days)
+COVID_SIGMA = 1.0 / 5.1 # Value obtained from study published in Annals of Internal Medicine (Lauer et al., 2020) [https://doi.org/10.7326/M20-0504]
+
+def _seir_odes(compartments, t, beta, sigma, gamma):
+    """
+        Defines the SEIR ODE system, where the population is split into four compartments.
+        All values are kept proportional, i.e., N=1, such that parameters are independent of scale.
+
+        ARGS:
+            compartments (list): Current [S, E, I, R] state values.
+            t            (float): Current time (unused directly, but required by odeint).
+            beta         (float): Transmission rate (fitted).
+            sigma        (float): Incubation rate = 1 / mean_incubation_days (fixed).
+            gamma        (float): Recovery rate (fitted).
+
+        RETURNS:
+            list: Derivatives [dS/dt, dE/dt, dI/dt, dR/dt].
+    """
+    S, E, I, R = compartments
+    N = S + E + I + R   # conserved quantity, i.e., equals 1.0
+    dS = -beta * S * I / N
+    dE =  beta * S * I / N - sigma * E
+    dI =  sigma * E - gamma * I
+    dR =  gamma * I
+    return [dS, dE, dI, dR]
+
+
+def _fit_seir_to_region(case_counts):
+    """
+        Fits SEIR ODE parameters to a single region's observed case curve using
+        Nelder-Mead optimisation, then returns the smoothed compartment trajectory.
+
+        ARGS:
+            case_counts (array): Observed daily case counts for one region, ordered by date.
+
+        RETURNS:
+            np.ndarray: Fitted trajectory of shape: [n_days, 4], columns = [S, E, I, R], expressed as proportions of the inferred total population (N=1).
+    """
+    case_arr = np.array(case_counts, dtype=float).clip(min=0)
+    n = len(case_arr)
+
+    # Normalisation
+    total = max(case_arr.sum(), 1.0)
+    i_obs = (case_arr / total).clip(0, 1)
+
+    # Seed initial compartment fractions from the first observed data point.
+    I0  = float(i_obs[0])
+    E0  = min(I0 * 2.0, 1.0)   # Exposed (E) pool is roughly twice infected early in an outbreak
+    R0  = 0.0
+    S0  = max(1.0 - I0 - E0 - R0, 0.0)
+    y0  = [S0, E0, I0, R0]
+
+    t_span = np.arange(n, dtype=float)
+
+    def _residuals(params):
+        beta, gamma = params
+        if beta <= 0 or gamma <= 0:
+            return 1e6
+        try:
+            sol = odeint(_seir_odes, y0, t_span, args=(beta, COVID_SIGMA, gamma))
+            return float(np.mean((sol[:, 2] - i_obs) ** 2))
+        except Exception:
+            return 1e6
+
+    # Optimise starting from typical COVID-19 parameter estimates.
+    result = minimize(
+        _residuals,
+        x0=[0.3, 0.1],
+        method='Nelder-Mead',
+        options={'xatol': 1e-4, 'fatol': 1e-4, 'maxiter': 2000},
+    )
+
+    beta_fit  = max(result.x[0], 1e-6)
+    gamma_fit = max(result.x[1], 1e-6)
+
+    trajectory = odeint(_seir_odes, y0, t_span, args=(beta_fit, COVID_SIGMA, gamma_fit))
+    # Clip to [0, 1] to guard against minor ODE solver overshoot.
+    return np.clip(trajectory, 0.0, 1.0)
+
+
+def read_datasets(window, rand_weight=False):
+    """
+        Loads graph and label data for all four countries in the dataset.
+
+        ARGS:
+            window      (int): Number of past days to include as node features.
+            rand_weight (bool): Whether to replace real edge weights with uniform weights of 1 (FOR TESTING).
+
+        RETURNS:
+            final_labels     (list): DataFrames of daily case counts per region per country.
+            final_graphs     (list): Lists of adjacency matrices (one per day) per country.
+            final_features   (list): Lists of node feature matrices (one per day) per country.
+            final_targets    (list): Lists of target case counts (one list per day) per country.
+    """
+    
+    os.chdir("../data")
+    final_labels = []
+    final_graphs = []
+    final_features = []
+    final_targets = []
+
+    # Italy
+    os.chdir("Italy")
+    labels = pd.read_csv("italy_labels.csv")
+    del labels["id"]
+    labels = labels.set_index("name")   # rows = regions, columns = dates
+
+    # Builds a list of date strings
+    sdate = date(2020, 2, 24)
+    edate = date(2020, 4, 24)
+    delta = edate - sdate
+    dates = [sdate + timedelta(days=i) for i in range(delta.days+1)]
+    dates = [str(date) for date in dates]
+    
+    
+    # Build one graph per day, keeping only regions and dates present in both the graph and labels.
+    Gs =generate_graphs(dates,"IT",rand_weight) 
+    labels = labels.loc[list(Gs[0].nodes()),:]
+    labels = labels.loc[:,dates]    
+    
+    final_labels.append(labels)
+    
+    # Convert each NetworkX graph to a plain numpy adjacency matrix.
+    gs_adj = [nx.adjacency_matrix(kgs).toarray().T for kgs in Gs]
+
+    final_graphs.append(gs_adj)
+
+    # Build a feature matrix per day using the past 'window' days of case counts.
+    features = generate_new_features(Gs ,labels ,dates ,window )
+
+    final_features.append(features)
+
+    # Collect the ground-truth case count for every region on every day.
+    y = list()
+    for i,G in enumerate(Gs):
+        y.append(list())
+        for node in G.nodes():
+            y[i].append(labels.loc[node,dates[i]])
+
+    final_targets.append(y)
+
+    # Spain
+    os.chdir("../Spain")
+    labels = pd.read_csv("spain_labels.csv")
+    labels = labels.set_index("name")
+
+    # Build a list of date strings
+    sdate = date(2020, 3, 12)
+    edate = date(2020, 5, 12)
+    delta = edate - sdate
+    dates = [sdate + timedelta(days=i) for i in range(delta.days+1)]
+    dates = [str(date) for date in dates]
+    
+    Gs =generate_graphs(dates,"ES",rand_weight)# 
+    labels = labels.loc[list(Gs[0].nodes()),:]
+    labels = labels.loc[:,dates]    #labels.sum(1).values>10
+
+    final_labels.append(labels)
+
+    gs_adj = [nx.adjacency_matrix(kgs).toarray().T for kgs in Gs]
+
+    final_graphs.append(gs_adj)
+
+    features = generate_new_features(Gs ,labels ,dates ,window )
+
+    final_features.append(features)
+
+    y = list()
+    for i,G in enumerate(Gs):
+        y.append(list())
+        for node in G.nodes():
+            y[i].append(labels.loc[node,dates[i]])
+
+    final_targets.append(y)
+
+    # Great Britain
+    os.chdir("../England")
+    labels = pd.read_csv("england_labels.csv")
+    labels = labels.set_index("name")
+
+    # Build a list of date strings
+    sdate = date(2020, 3, 13)
+    edate = date(2020, 5, 12)
+    delta = edate - sdate
+    dates = [sdate + timedelta(days=i) for i in range(delta.days+1)]
+    dates = [str(date) for date in dates]
+
+    Gs =generate_graphs(dates,"EN",rand_weight)
+    
+    labels = labels.loc[list(Gs[0].nodes()),:]
+    labels = labels.loc[:,dates]    
+    
+    final_labels.append(labels)
+
+    gs_adj = [nx.adjacency_matrix(kgs).toarray().T for kgs in Gs]
+    final_graphs.append(gs_adj)
+
+    features = generate_new_features(Gs ,labels ,dates ,window)
+    final_features.append(features)
+
+    y = list()
+    for i,G in enumerate(Gs):
+        y.append(list())
+        for node in G.nodes():
+            y[i].append(labels.loc[node,dates[i]])
+    final_targets.append(y)
+
+    # France
+    os.chdir("../France")
+    labels = pd.read_csv("france_labels.csv")
+    labels = labels.set_index("name")
+
+    # Build a list of date strings
+    sdate = date(2020, 3, 10)
+    edate = date(2020, 5, 12)
+    delta = edate - sdate
+    dates = [sdate + timedelta(days=i) for i in range(delta.days+1)]
+    dates = [str(date) for date in dates]
+    labels = labels.loc[:,dates]
+
+    Gs =generate_graphs(dates,"FR",rand_weight)
+    gs_adj = [nx.adjacency_matrix(kgs).toarray().T for kgs in Gs]
+
+    labels = labels.loc[list(Gs[0].nodes()),:]
+    
+    final_labels.append(labels)
+
+    final_graphs.append(gs_adj)
+
+    features = generate_new_features(Gs ,labels ,dates ,window)
+
+    final_features.append(features)
+
+    y = list()
+    for i,G in enumerate(Gs):
+        y.append(list())
+        for node in G.nodes():
+            y[i].append(labels.loc[node,dates[i]])
+
+    final_targets.append(y)
+    
+    # Return to the source code directory after reading all data files.
+    os.chdir("../../code")
+
+    return final_labels, final_graphs, final_features, final_targets
+    
+    
+def generate_graphs(dates, country, rand_weight=False):
+    """
+        Builds a directed graph for each date by reading the corresponding mobility CSV file.
+
+        ARGS:
+            dates       (list[str]): List of date strings (YYYY-MM-DD) to load graphs for.
+            country     (str): Country code prefix used in filenames such as 'IT', 'FR', etc.
+            rand_weight (bool): Whether every edge is added with weight 1 instead of real flows (FOR TESTING).
+
+        RETURNS:
+            list[nx.DiGraph]: One NetworkX directed graph per date, with edge weights as mobility flows.
+    """
+    
+    Gs = []
+    for date in dates:
+        d = pd.read_csv("graphs/" + country + "_" + date + ".csv",header=None)
+        G = nx.DiGraph()
+        
+        # Gather every unique region that appears as a source or destination.
+        nodes = set(d[0].unique()).union(set(d[1].unique()))
+        nodes = sorted(nodes)
+        G.add_nodes_from(nodes)
+
+        if rand_weight:
+            # Ignore actual travel flows and connect every pair of regions with weight 1.
+            for node_start in list(G.nodes):
+                for node_end in list(G.nodes):
+                    G.add_edge(node_start, node_end, weight=1)
+        else:
+            # Add each row as a directed edge from source to destination with the observed flow weight.
+            for row in d.iterrows():
+                G.add_edge(row[1][0], row[1][1], weight=row[1][2])
+
+        Gs.append(G)
+        
+    return Gs
+
+
+def generate_new_features(Gs, labels, dates, window=7, scaled=False):
+    """
+        Builds a feature matrix for each day, where each row is a region and columns are:
+        - the past 'window' days of case counts, followed by
+        - S, E, I, R proportions from a region-level fitted SEIR model at the current day.
+
+        ARGS:
+            Gs      (list[nx.DiGraph]): One graph per day.
+            labels  (pd.DataFrame): Case counts with regions as rows and date strings as columns.
+            dates   (list[str]): Ordered list of date strings matching the graphs.
+            window  (int): How many past days of cases to include as features.
+            scaled  (bool): Whether to standardise case counts by each region's historical mean and standard deviation.
+
+        RETURNS:
+            list[np.ndarray]: One feature matrix per day of size: [n_nodes, window + 4]. The last four columns are the fitted SEIR state [S, E, I, R].
+    """
+    
+    features = list()
+
+    labs = labels.copy()
+
+    # Pre-fit a SEIR model for every region using the full date range, then cache the trajectory so that each day's loop can simply index into it without re-fitting.
+    seir_cache = {}
+    for node in Gs[0].nodes():
+        case_counts = labs.loc[node, dates].values.astype(float)
+        seir_cache[node] = _fit_seir_to_region(case_counts)  # shape: [len(dates), 4]
+
+    for idx,G in enumerate(Gs):
+        # Feature matrix: 'window' case-count columns + 4 SEIR compartment columns.
+        H = np.zeros([G.number_of_nodes(), window + 4])
+
+        # Per-region mean and std. deviation of all past cases (used only when scaled = True).
+        me = labs.loc[:, dates[:(idx)]].mean(1)
+        sd = labs.loc[:, dates[:(idx)]].std(1)+1   # +1 avoids division by zero
+
+        # Enumerates because the row index of 'H' and the node name in 'labs' don't match directly.
+        for i,node in enumerate(G.nodes()):
+            if(idx < window):   # not enough history yet, hence, pad the left with zeros
+                if(scaled):
+                    H[i,(window-idx):(window)] = (labs.loc[node, dates[0:(idx)]] - me[node])/ sd[node]
+                else:
+                    H[i,(window-idx):(window)] = labs.loc[node, dates[0:(idx)]]
+
+            elif idx >= window:   # full window available, hence, fill all columns
+                if(scaled):
+                    H[i,0:(window)] =  (labs.loc[node, dates[(idx-window):(idx)]] - me[node])/ sd[node]
+                else:
+                    H[i,0:(window)] = labs.loc[node, dates[(idx-window):(idx)]]
+
+            # Append the fitted SEIR state for this region at the current day.
+            H[i, window:] = seir_cache[node][idx]
+
+        features.append(H)
+        
+    return features
+
+
+def generate_new_batches(Gs, features, y, idx, graph_window, shift, batch_size, device, test_sample, decay=0.5):
+    """
+        Packages graph data into batches ready to feed into the model for training.
+
+        ARGS:
+            Gs           (list[sp.spmatrix]): List of sparse adjacency matrices, one per day.
+            features     (list[np.ndarray]): Node feature matrices, one per day.
+            y            (list): Target case counts, one list of values per day.
+            idx          (list[int]): Indices of days to include in these batches.
+            graph_window (int): How many consecutive days to stack into a single sample.
+            shift        (int): How many days ahead the model should predict.
+            batch_size   (int): Number of samples per batch.
+            device       (torch.device): CPU or GPU to send tensors to.
+            test_sample  (int): Last training-day index; used to avoid peeking at future labels during testing.
+            decay        (float): Exponential time decay rate applied to edge weights.
+
+        RETURNS:
+            adj_lst      (list[torch.sparse_coo_tensor]): Block-diagonal adjacency tensors, one per batch.
+            features_lst (list[torch.FloatTensor]): Stacked feature tensors, one per batch.
+            y_lst        (list[torch.FloatTensor]): Target value tensors, one per batch.
+    """
+
+    N = len(idx)
+    n_nodes = Gs[0].shape[0]
+
+    adj_lst = list()
+    features_lst = list()
+    y_lst = list()
+
+    for i in range(0, N, batch_size):
+        n_nodes_batch = (min(i+batch_size, N)-i)*graph_window*n_nodes
+        step = n_nodes*graph_window
+
+        adj_tmp = list()
+        features_tmp = np.zeros((n_nodes_batch, features[0].shape[1]))
+        y_tmp = np.zeros((min(i+batch_size, N)-i)*n_nodes)
+
+        # Fill features and adjacency for each sample in the batch.
+        for e1,j in enumerate(range(i, min(i+batch_size, N) )):
+            val = idx[j]
+
+            # Stack 'graph_window' consecutive days of graphs and features for this sample.
+            for e2,k in enumerate(range(val-graph_window+1,val+1)):
+                # Compute how many steps back from the current day this snapshot is.
+                lag = graph_window - 1 - e2
+
+                # Scale edge weights exponentially where recent days keep full weight and older days are down-weighted accordingly.
+                decay_weight = np.exp(-decay * lag)
+
+                adj_tmp.append(Gs[k-1].T * decay_weight)  
+                features_tmp[(e1*step+e2*n_nodes):(e1*step+(e2+1)*n_nodes),:] = features[k]
+            
+            # Ensures that during testing, no peeking occurs beyond the last known day. Hence, final label is repeated instead.
+            if(test_sample>0):
+                if(val+shift<test_sample):
+                    y_tmp[(n_nodes*e1):(n_nodes*(e1+1))] = y[val+shift]
+                else:
+                    y_tmp[(n_nodes*e1):(n_nodes*(e1+1))] = y[val]
+            else:
+                y_tmp[(n_nodes*e1):(n_nodes*(e1+1))] = y[val+shift]
+        
+        # Merge all daily adjacency matrices into one huge block-diagonal sparse matrix.
+        adj_tmp = sp.block_diag(adj_tmp)
+        adj_lst.append(sparse_matrix_to_torch_sparse_tensor(adj_tmp).to(device))
+        features_lst.append(torch.FloatTensor(features_tmp).to(device))
+        y_lst.append(torch.FloatTensor(y_tmp).to(device))
+
+    return adj_lst, features_lst, y_lst
+
+
+def sparse_matrix_to_torch_sparse_tensor(sparse_mx):
+    """
+        Converts a SciPy sparse matrix into a PyTorch sparse tensor to be used on GPU.
+
+        ARGS:
+            sparse_mx (sp.spmatrix): Any scipy sparse matrix.
+
+        RETURNS:
+            torch.sparse.FloatTensor: Equivalent sparse tensor with the same values and shape.
+    """
+    sparse_mx = sparse_mx.tocoo().astype(np.float32)
+    indices = torch.from_numpy(
+        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
+    values = torch.from_numpy(sparse_mx.data)
+    shape = torch.Size(sparse_mx.shape)
+    return torch.sparse.FloatTensor(indices, values, shape)
+
+# === CLASS DEFINITION === 
+
+class AverageMeter(object):
+    """Running tracker that keeps a rolling average of a metric across batches."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Zeroes all counters and is called at the start of each epoch."""
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        """
+            Records a new measurement and updates the running average.
+
+            ARGS:
+                val (float): The new metric value to record.
+                n   (int): How many samples this value represents (default 1).
+        """
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count

@@ -1,0 +1,27 @@
+.gitignore
+# Ignore everything at the top level
+/*
+
+# Except these core files and directories
+!/.gitignore
+!/README.md
+!/requirements.txt
+!/src/
+!/data/
+
+# Unignore all contents inside the whitelisted directories
+!/src/**
+!/data/**
+
+# Keep virtual environment ignored
+/.venv/
+
+# Common Python artifacts to ignore everywhere except inside src/ and data/
+*.pyc
+__pycache__/
+
+# But allow files under src/ and data/ to be tracked (override above ignores)
+!/src/**/*.pyc
+!/data/**/*.pyc
+!/src/**/__pycache__/
+!/data/**/__pycache__/
