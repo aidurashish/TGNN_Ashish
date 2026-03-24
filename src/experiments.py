@@ -49,7 +49,7 @@ def train(adj, features, y):
         
         # Diffusion training: epsilon-prediction loss on encoder conditioning.
         loss_train = model.compute_diffusion_loss(adj, features, y)
-        loss_train.backward(retain_graph=True)
+        loss_train.backward()
         for p in model.parameters():
             if p.grad is not None:
                 torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
@@ -65,7 +65,7 @@ def train(adj, features, y):
         # SEIR consistency penalty (predicted case counts cannot be negative).
         seir_penalty = F.relu(-output).mean()
         loss_train = loss_mse + SEIR_LAMBDA * seir_penalty
-        loss_train.backward(retain_graph=True)
+        loss_train.backward()
         for p in model.parameters():
             if p.grad is not None:
                 torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
@@ -89,8 +89,9 @@ def test(adj, features, y):
             loss_test (torch.Tensor): MSE loss scalar.
     """
     
-    output = model(adj, features)
-    loss_test = F.mse_loss(output, y)
+    with torch.no_grad():
+        output = model(adj, features)
+        loss_test = F.mse_loss(output, y)
     return output, loss_test
 
 # === MAIN ===
@@ -183,13 +184,26 @@ if __name__ == '__main__':
             for shift in list(range(0,args.ahead)):
                 print("\n  [SHIFT {}/{}] Model={} Country={}".format(shift + 1, args.ahead, args.model, country))
 
+                # --- Resume check: skip this shift if all three outputs already exist and are complete. ---
+                _pred_path   = "../Predictions/predict_{}_shift{}_{}.csv".format(args.model, shift, country)
+                _truth_path  = "../Predictions/truth_{}_shift{}_{}.csv".format(args.model, shift, country)
+                _results_path = "../results/results_{}_temporal.csv".format(country)
+                _results_row = "{}_AGW_MMR_{},{},".format(args.model, args.rand_weights, shift)
+                _results_done = False
+                if os.path.exists(_results_path):
+                    with open(_results_path) as _f:
+                        _results_done = any(line.startswith(_results_row) for line in _f)
+                if os.path.exists(_pred_path) and os.path.exists(_truth_path) and _results_done:
+                    print("    [SKIP] Outputs already exist, skipping.")
+                    continue
+                # -----------------------------------------------------------------------------------------
+
                 result = []                                 # stores mean absolute error (MAE) per test day
                 y_pred = np.empty((n_nodes, 0), dtype=int)  # accumulates predictions column by column
                 y_true = np.empty((n_nodes, 0), dtype=int)  # accumulates ground-truth column by column
                 y_uncert = np.empty((n_nodes, 0), dtype=float)  # accumulates per-node uncertainty (std. deviation) for diffusion model
                 y_val = []
                 exp = 0
-                fw = open("../results/results_"+country+"_temporal.csv","a")
 
                 n_test_days = n_samples - shift - args.start_exp
                 print("    Rolling window: {} test days ({} to {})".format(n_test_days, args.start_exp, n_samples - shift - 1))
@@ -223,8 +237,16 @@ if __name__ == '__main__':
                     # === TRAINING ===
                     
                     # Re-initialise model and optimizer fresh for each (test_sample, shift) pair.
+                    best_val_acc = float('inf')  # persists across restarts; tracks globally best val loss
+                    max_restarts = 10
+                    restart_count = 0
                     stop = False
                     while(not stop):
+                        restart_count += 1
+                        if restart_count > max_restarts:
+                            print("\n    [WARN] Max restarts ({}) exceeded for test_sample={}. Using best checkpoint found.".format(max_restarts, test_sample))
+                            stop = True
+                            break
                         if args.model == "ATMGNN_Diff":
                             model = ATMGNN_Diff(nfeat=nfeat, nhidden=args.hidden, nout=1, n_nodes=n_nodes, window=args.graph_window, dropout=args.dropout, nhead=1, diffusion_steps=args.diffusion_steps).to(device)
                         else:
@@ -235,7 +257,6 @@ if __name__ == '__main__':
                         # Reduce learning rate when validation loss stops improving.
                         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10)
 
-                        best_val_acc = 1e8      # tracks the lowest validation loss seen so far
                         val_among_epochs = []
                         train_among_epochs = []
                         stop = False
@@ -266,9 +287,19 @@ if __name__ == '__main__':
                             train_among_epochs.append(train_loss.avg)
                             val_among_epochs.append(val_loss)
 
-                            # If val_loss is NaN, training has diverged => restart with a fresh model.
-                            if val_loss != val_loss:  # NaN check
-                                print("\n    [WARN] NaN val_loss at epoch {} => restarting with fresh model.".format(epoch + 1))
+                            # Save a checkpoint whenever the model achieves a new best validation loss.
+                            # (Before break conditions so a checkpoint always exists even on diverged restarts.)
+                            if val_loss < best_val_acc:
+                                best_val_acc = val_loss
+                                torch.save({
+                                    'state_dict': model.state_dict(),
+                                    'optimizer' : optimizer.state_dict(),
+                                    'edge_decay' : args.edge_decay,
+                                }, '../Checkpoints/model_best_{}_shift{}_{}_RW_{}_seed{}_AG.pth.tar'.format(args.model, shift, country, args.rand_weights, args.rand_seed))
+
+                            # If val_loss is NaN, Inf, or astronomically large (>1e12), training has diverged and will not recover => restart with a fresh model.
+                            if not np.isfinite(val_loss) or val_loss > 1e12:
+                                print("\n    [WARN] Diverged val_loss ({:.3e}) at epoch {} => restarting with fresh model.".format(val_loss, epoch + 1))
                                 stop = False
                                 break
 
@@ -286,24 +317,21 @@ if __name__ == '__main__':
 
                             stop = True
 
-                            # Save a checkpoint whenever the model achieves a new best validation loss.
-                            if val_loss < best_val_acc:
-                                best_val_acc = val_loss
-                                torch.save({
-                                    'state_dict': model.state_dict(),
-                                    'optimizer' : optimizer.state_dict(),
-                                    'edge_decay' : args.edge_decay,
-                                }, '../Checkpoints/model_best_{}_shift{}_{}_RW_{}_seed{}_AG.pth.tar'.format(args.model, shift, country, args.rand_weights, args.rand_seed))
-
                             scheduler.step(val_loss)
 
 
                     # === TESTING ===
-                    
-                    test_loss = AverageMeter()
 
                     # Reload the best checkpoint saved during training before running on the test day.
-                    checkpoint = torch.load('../Checkpoints/model_best_{}_shift{}_{}_RW_{}_seed{}_AG.pth.tar'.format(args.model, shift, country, args.rand_weights, args.rand_seed))
+                    _ckpt_path = '../Checkpoints/model_best_{}_shift{}_{}_RW_{}_seed{}_AG.pth.tar'.format(args.model, shift, country, args.rand_weights, args.rand_seed)
+                    if not os.path.exists(_ckpt_path):
+                        print("\n    [WARN] No checkpoint was saved for test_sample={} (all restarts diverged). Skipping this day.".format(test_sample))
+                        del adj_train, features_train, y_train
+                        del adj_val, features_val, y_val
+                        del adj_test, features_test, y_test
+                        torch.cuda.empty_cache()
+                        continue
+                    checkpoint = torch.load(_ckpt_path, weights_only=False)
                     model.load_state_dict(checkpoint['state_dict'])
                     optimizer.load_state_dict(checkpoint['optimizer'])
                     model.eval()
@@ -336,7 +364,17 @@ if __name__ == '__main__':
                     if uncertainty is not None:
                         y_uncert = np.append(y_uncert, uncertainty.cpu().numpy().reshape(-1,1), axis=1)
 
+                    # Free per-day GPU tensors and release cached VRAM between iterations.
+                    del adj_train, features_train, y_train
+                    del adj_val, features_val, y_val
+                    del adj_test, features_test, y_test
+                    torch.cuda.empty_cache()
+
                 # Print summary metrics across all test days for this (country, shift) pair.
+                if len(result) == 0:
+                    print("\n  [SHIFT {} SUMMARY] Model={} Country={} — no valid predictions (all days diverged), skipping.".format(shift, args.model, country))
+                    continue
+
                 print("\n  [SHIFT {} SUMMARY] Model={} Country={}".format(shift, args.model, country))
                 print("    MAE={:.5f}  std={:.5f}  MSE={:.5f}  RMSE={:.5f}  R2={:.5f}".format(
                     mean_absolute_error(y_true, y_pred),
@@ -346,8 +384,8 @@ if __name__ == '__main__':
                     r2_score(y_true, y_pred)))
 
                 # Write metrics to CSV and save raw prediction/truth arrays to disk.
-                fw.write(str(args.model)+"_AGW_MMR_"+str(args.rand_weights)+","+str(shift)+",{:.5f}".format(np.mean(result))+",{:.5f}".format(np.std(result))+",{:.5f}".format(mean_absolute_error(y_true, y_pred))+",{:.5f}".format(mean_squared_error(y_true, y_pred))+",{:.5f}".format(np.sqrt(mean_squared_error(y_true, y_pred)))+",{:.5f}".format(r2_score(y_true, y_pred))+"\n")
-                fw.close()
+                with open("../results/results_"+country+"_temporal.csv", "a") as fw:
+                    fw.write(str(args.model)+"_AGW_MMR_"+str(args.rand_weights)+","+str(shift)+",{:.5f}".format(np.mean(result))+",{:.5f}".format(np.std(result))+",{:.5f}".format(mean_absolute_error(y_true, y_pred))+",{:.5f}".format(mean_squared_error(y_true, y_pred))+",{:.5f}".format(np.sqrt(mean_squared_error(y_true, y_pred)))+",{:.5f}".format(r2_score(y_true, y_pred))+"\n")
                 np.savetxt("../Predictions/predict_{}_shift{}_{}.csv".format(args.model, shift, country), y_pred, fmt="%.5f", delimiter=',')
                 np.savetxt("../Predictions/truth_{}_shift{}_{}.csv".format(args.model, shift, country), y_true, fmt="%.5f", delimiter=',')
                 if y_uncert.shape[1] > 0:

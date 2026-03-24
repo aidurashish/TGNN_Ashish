@@ -40,17 +40,17 @@ class MPNN_Encoder(nn.Module):
         self.conv1 = GCNConv(nfeat, nhidden)
         self.conv2 = GCNConv(nhidden, nhidden)
         
-        # Learns how important each connection (edge) between two nodes is.
+        # Learns how important each connection (edge) between two nodes is based on their features (hence, 2*nfeat) and outputs 1 number.
         self.edge_attn = nn.Linear(2 * nfeat, 1)
         
-        # Batch normalisation (per layer)
+        # Batch normalisation (per layer), such that mean = 0 and std = 1.
         self.bn1 = nn.BatchNorm1d(nhidden)
         self.bn2 = nn.BatchNorm1d(nhidden)
 
-        # Two fully-connected layers that compress the concatenated features into the output size.
+        # Two fully-connected dense layers that compress the concatenated features into the output size (nout).
         # Done in two consecutive  steps to achieve gradual, non-linear compression.
-        self.fc1 = nn.Linear(nfeat+2*nhidden, nhidden )
-        self.fc2 = nn.Linear(nhidden, nout)
+        self.fc1 = nn.Linear(nfeat+2*nhidden, nhidden ) # compress to size: nhidden
+        self.fc2 = nn.Linear(nhidden, nout) # compress to size: nout
 
         self.dropout = nn.Dropout(dropout)
         self.relu = nn.ReLU()   # for non-linearity (zeroes out negative values).
@@ -67,17 +67,17 @@ class MPNN_Encoder(nn.Module):
                 torch.Tensor: Encoded node embeddings of shape: [num_nodes, nout].
         """
         # Unpack edge sources, destinations and weights from sparse adjacency tensor (adj)
-        lst = list()    
-        weight = adj.coalesce().values()
-        adj = adj.coalesce().indices()
-        src, dst = adj[0], adj[1]
+        lst = list()   # for collecting feature snapshots at different stages and final concatenation 
+        weight = adj.coalesce().values()    # merge duplicates and extract non-zero edge weights
+        adj = adj.coalesce().indices()  # merge duplicates and extract non-zero connections
+        src, dst = adj[0], adj[1]   # collects source node indices and destination node indices
         
-        # Score each edge: "How much should this connection matter given the features at both ends?"
+        # Score each edge: "How much should this connection matter given the features at both ends?", given a score range [0, 1].
         attn = torch.sigmoid(self.edge_attn(torch.cat([x[src], x[dst]], dim=1))).squeeze(-1)
         
         # Re-scale original edge weights by the learned attention scores.
         weight = weight * attn
-        lst.append(x)
+        lst.append(x)   # save original raw features as first element
 
         # First message-passing round where each node gathers weighted info from its neighbours.
         x = self.relu(self.conv1(x,adj,edge_weight=weight))
@@ -92,7 +92,7 @@ class MPNN_Encoder(nn.Module):
         lst.append(x)
 
         # Stack raw features and both hidden layers, then compress to output size.
-        x = torch.cat(lst, dim=1)
+        x = torch.cat(lst, dim=1)   # concatenate all three snapshots horizontally
         x = self.relu(self.fc1(x))
         x = self.dropout(x)
         x = self.relu(self.fc2(x))
@@ -126,10 +126,10 @@ class ATMGNN(nn.Module):
         self.n_nodes = n_nodes
         self.nhidden = nhidden
         self.nfeat = nfeat
-        self.nhead = nhead
+        self.nhead = nhead  # more heads = look at time form more perspectives
         self.use_norm = use_norm
 
-        # Encodes the full-resolution graph (finest coarseness level).
+        # Encodes the full-resolution graph (finest coarseness level w/ no cluster-grouping).
         self.bottom_encoder = MPNN_Encoder(nfeat, nhidden, nhidden, dropout)
 
         self.num_clusters = num_clusters
@@ -139,17 +139,18 @@ class ATMGNN(nn.Module):
         self.middle_encoder = nn.ModuleList()
 
         for size in self.num_clusters:
-            # Maps node embeddings to cluster assignments, i.e., decides which group each node belongs to.
+            # Maps each node's embeddings to 'size'-dimensional cluster assignments, i.e., decides which group each node belongs to.
             self.middle_linear.append(nn.Linear(nhidden, size))
             
             # Learns a new embedding for each cluster after the graph is shrunk.
             self.middle_encoder.append(nn.Linear(nhidden, nhidden))
 
+        # With 2 coarsening levels and the bottom (finest) level, we have 3 x 'nhidden' features per node.
         # Two layers that blend information from all coarseness levels into one representation.
-        self.mix_1 = nn.Linear((len(self.num_clusters) + 1) * nhidden, 512)
-        self.mix_2 = nn.Linear(512, (len(self.num_clusters) + 1) * nhidden)
+        self.mix_1 = nn.Linear((len(self.num_clusters) + 1) * nhidden, 512) # expand to identify cross-resolution interactions
+        self.mix_2 = nn.Linear(512, (len(self.num_clusters) + 1) * nhidden) # compress back to discard noise
 
-        # Lets each timestep decide how much to pay attention to every other timestep.
+        # Lets each timestep decide how much to pay attention to every other timestep via voting.
         self.self_attention = nn.MultiheadAttention((len(self.num_clusters) + 1) * nhidden, self.nhead, dropout=dropout)
         
         # Turns window timesteps into a single summary vector per region.
@@ -166,7 +167,7 @@ class ATMGNN(nn.Module):
     def encode(self, adj, x):
         """
             Runs the multi-resolution graph encoding and temporal attention pipeline,
-            returning the conditioning representation before the final fully-connected layers.
+            returning the conditioning representation before the final fully-connected layers (for diffusion decoder).
 
             ARGS:
                 adj (torch.sparse_coo_tensor): Shared adjacency matrix for the graph.
@@ -176,11 +177,11 @@ class ATMGNN(nn.Module):
                 torch.Tensor: Conditioning representation of shape: [batch*n_nodes, cond_dim].
         """
         
-        # Save raw input features before processing for end concatenation.
-        skip = x.view(-1, self.window, self.n_nodes, self.nfeat)
-        skip = torch.transpose(skip, 1, 2).reshape(-1, self.window, self.nfeat)
+        # Save raw input features before processing for end concatenation (skip connection).
+        skip = x.view(-1, self.window, self.n_nodes, self.nfeat)    # reshape accordingly
+        skip = torch.transpose(skip, 1, 2).reshape(-1, self.window, self.nfeat) # reorganizes such that each row = one city across time.
 
-        x = x.view(-1, self.nfeat)
+        x = x.view(-1, self.nfeat)  # flattens to MPNN_Encoder expected format
 
         # Collect embeddings from the finest level and every coarser level.
         all_latents = []
@@ -197,7 +198,6 @@ class ATMGNN(nn.Module):
         latent = bottom_latent
 
         for level in range(len(self.num_clusters)):
-            size = self.num_clusters[level]
 
             # Assign each node to exactly one cluster 
             assign = self.middle_linear[level](latent)
@@ -303,7 +303,7 @@ def _sinusoidal_embedding(timesteps, dim):
 
 class ConditionedDenoiser(nn.Module):
     """
-        Lightweight MLP that predicts the noise component in a noisy target,
+        Lightweight MLP (multi-layer perceptron) that predicts the noise component in a noisy target,
         given the current timestep embedding and the conditioning vector produced by ATMGNN's encoder.
     """
 
@@ -449,7 +449,7 @@ class DiffusionDecoder(nn.Module):
                 alpha_bar_t = self.alpha_bar[t_idx]
                 beta_t = self.betas[t_idx]
 
-                # DDPM reverse-step mean: mu = (1/sqrt(alpha_t)) * (x_t - beta_t/sqrt(1-alpha_bar_t) * eps)
+                # DDPM reverse-step mean
                 coef1 = 1.0 / torch.sqrt(alpha_t)
                 coef2 = beta_t / torch.sqrt(1.0 - alpha_bar_t)
                 mu = coef1 * (x - coef2 * noise_pred)
