@@ -121,12 +121,11 @@ def read_datasets(window, rand_weight=False):
     # Italy
     os.chdir("Italy [COVID-19]")
     labels = pd.read_csv("italy_labels.csv")
-    del labels["id"]
     labels = labels.set_index("name")   # rows = regions, columns = dates
 
     # Builds a list of date strings
-    sdate = date(2020, 2, 24)
-    edate = date(2020, 4, 24)
+    sdate = date(2020, 3, 13)
+    edate = date(2020, 5, 12)
     delta = edate - sdate
     dates = [sdate + timedelta(days=i) for i in range(delta.days+1)]
     dates = [str(date) for date in dates]
@@ -164,13 +163,13 @@ def read_datasets(window, rand_weight=False):
     labels = labels.set_index("name")
 
     # Build a list of date strings
-    sdate = date(2020, 3, 12)
+    sdate = date(2020, 3, 13)
     edate = date(2020, 5, 12)
     delta = edate - sdate
     dates = [sdate + timedelta(days=i) for i in range(delta.days+1)]
     dates = [str(date) for date in dates]
     
-    Gs =generate_graphs(dates,"ES",rand_weight)# 
+    Gs =generate_graphs(dates,"ES",rand_weight)
     labels = labels.loc[list(Gs[0].nodes()),:]
     labels = labels.loc[:,dates]    #labels.sum(1).values>10
 
@@ -230,12 +229,11 @@ def read_datasets(window, rand_weight=False):
     labels = labels.set_index("name")
 
     # Build a list of date strings
-    sdate = date(2020, 3, 10)
+    sdate = date(2020, 3, 13)
     edate = date(2020, 5, 12)
     delta = edate - sdate
     dates = [sdate + timedelta(days=i) for i in range(delta.days+1)]
     dates = [str(date) for date in dates]
-    labels = labels.loc[:,dates]
 
     Gs =generate_graphs(dates,"FR",rand_weight)
     gs_adj = [nx.adjacency_matrix(kgs).toarray().T for kgs in Gs]
