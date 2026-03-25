@@ -12,3 +12,7 @@ pandas
 
 # Machine learning (ML) modules
 scikit-learn
+
+# Visualisation modules
+seaborn
+plotly
