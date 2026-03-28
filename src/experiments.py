@@ -22,6 +22,9 @@ from math import ceil
 from utils import generate_new_batches, AverageMeter, read_datasets
 from models import ATMGNN, ATMGNN_Diff
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib
+matplotlib.use('Agg')   # non-interactive backend; safe for scripts with no display
+import matplotlib.pyplot as plt
 
 # === FUNCTIONS === 
 
@@ -94,27 +97,79 @@ def test(adj, features, y):
         loss_test = F.mse_loss(output, y)
     return output, loss_test
 
+
+def _plot_loss_curve(train_losses, val_losses, model_name, country, out_dir):
+    """
+        Saves a train/val loss vs epoch curve for one (model, country) pair.
+        Uses the final training run (shift=0, last test_sample — most training data).
+    """
+    fig, ax = plt.subplots(figsize=(8, 4))
+    epochs = range(1, len(train_losses) + 1)
+    ax.plot(epochs, train_losses, label='Train loss', linewidth=1.5)
+    ax.plot(epochs, val_losses,   label='Val loss',   linewidth=1.5, linestyle='--')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss (MSE)')
+    ax.set_title('{} — {} — Loss / Epoch'.format(model_name, country))
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    path = os.path.join(out_dir, '{}_{}_loss_curve.png'.format(model_name, country))
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print('  [PLOT] Loss curve saved to {}'.format(path))
+
+
+def _plot_predictions_vs_actuals(pred_store, model_name, country, out_dir):
+    """Saves a grid of subplots (one per shift) comparing mean predicted vs mean actual daily case counts (averaged across all regions) for one (model, country) pair."""
+    shifts = sorted(pred_store.keys())
+    if not shifts:
+        return
+    ncols = min(len(shifts), 4)
+    nrows = (len(shifts) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.5 * nrows), squeeze=False)
+    for i, shift in enumerate(shifts):
+        ax = axes[i // ncols][i % ncols]
+        mean_pred, mean_true = pred_store[shift]
+        days = range(1, len(mean_true) + 1)
+        ax.plot(days, mean_true, label='Actual',    linewidth=1.5, color='steelblue')
+        ax.plot(days, mean_pred, label='Predicted', linewidth=1.5, color='tomato', linestyle='--')
+        ax.set_title('Shift +{} day{}'.format(shift, '' if shift == 1 else 's'))
+        ax.set_xlabel('Test day')
+        ax.set_ylabel('Mean case count')
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+    # Hide any unused subplot panels
+    for j in range(len(shifts), nrows * ncols):
+        axes[j // ncols][j % ncols].set_visible(False)
+    fig.suptitle('{} — {} — Predictions vs Actuals'.format(model_name, country), fontsize=12)
+    fig.tight_layout()
+    path = os.path.join(out_dir, '{}_{}_predictions_vs_actuals.png'.format(model_name, country))
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print('  [PLOT] Predictions vs actuals saved to {}'.format(path))
+
+
 # === MAIN ===
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=300, help='Number of epochs.')
+    parser.add_argument('--epochs', type=int, default=75, help='Number of epochs.')
     parser.add_argument('--lr', type=float, default=0.001, help='Starting learning rate.')
     parser.add_argument('--hidden', type=int, default=32, help='Number of hidden units.')
     parser.add_argument('--batch-size', type=int, default=128, help='Size of batch.')
-    parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate.')
+    parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate.')
     parser.add_argument('--window', type=int, default=7, help='Size of window for features.')
     parser.add_argument('--graph-window', type=int, default=7, help='Size of window for graphs.')
-    parser.add_argument('--early-stop', type=int, default=100, help='How many epochs to wait before stopping.')
+    parser.add_argument('--early-stop', type=int, default=30, help='How many epochs to wait before stopping.')
     parser.add_argument('--start-exp', type=int, default=15, help='The first day to start the predictions.')
-    parser.add_argument('--ahead', type=int, default=21, help='The number of days ahead of the train set the predictions should reach.')
+    parser.add_argument('--ahead', type=int, default=7, help='The number of days ahead of the train set the predictions should reach.')
     parser.add_argument('--sep', type=int, default=10, help='Seperator for validation and train set.')
     parser.add_argument('--rand-weights', type=bool, default=False, help="True or False. Enable ablation where weights in the adjacency matrix are shuffled.")
     parser.add_argument('--rand-seed', type=int, default=0, help="Specify the random seeds for reproducibility.")
     parser.add_argument('--edge-decay', type=float, default=0.5, help='Exponential time decay for edge weights across the graph window (Set to 0.0 to disable decay).')
     parser.add_argument('--model-name', type=str, default='ATMGNN_Diff', choices=['ATMGNN', 'ATMGNN_Diff'], help='Model architecture to train (ATMGNN = deterministic head, ATMGNN_Diff = diffusion decoder).')
-    parser.add_argument('--diffusion-steps', type=int, default=8, help='Number of DDPM denoising steps T (only used with ATMGNN_Diff).')
-    parser.add_argument('--num-samples', type=int, default=50, help='Number of diffusion samples at inference for uncertainty estimation (only used with ATMGNN_Diff).')
+    parser.add_argument('--diffusion-steps', type=int, default=100, help='Number of DDPM denoising steps T (only used with ATMGNN_Diff).')
+    parser.add_argument('--num-samples', type=int, default=10, help='Number of diffusion samples at inference for uncertainty estimation (only used with ATMGNN_Diff).')
     
     args = parser.parse_args()
     
@@ -176,10 +231,14 @@ if __name__ == '__main__':
             os.makedirs('../Checkpoints')
         if not os.path.exists('../Predictions'):
             os.makedirs('../Predictions')
+        if not os.path.exists('../figures/training'):
+            os.makedirs('../figures/training')
 
         
         for args.model in ['ATMGNN', 'ATMGNN_Diff']:   # Trains both models sequentially in one run
             print("\n[MODEL] Starting training: {} on {}".format(args.model, country))
+            _loss_history = None    # (train_losses, val_losses) from shift=0 last test_sample
+            _pred_store = {}        # shift -> (mean_pred_per_day, mean_true_per_day)
             # Predicts 0, 1, ..., 'ahead' - 1 days into the future.
             for shift in list(range(0,args.ahead)):
                 print("\n  [SHIFT {}/{}] Model={} Country={}".format(shift + 1, args.ahead, args.model, country))
@@ -238,7 +297,7 @@ if __name__ == '__main__':
                     
                     # Re-initialise model and optimizer fresh for each (test_sample, shift) pair.
                     best_val_acc = float('inf')  # persists across restarts; tracks globally best val loss
-                    max_restarts = 10
+                    max_restarts = 3
                     restart_count = 0
                     stop = False
                     while(not stop):
@@ -255,7 +314,7 @@ if __name__ == '__main__':
                         optimizer = optim.Adam(model.parameters(), lr=args.lr)
                         
                         # Reduce learning rate when validation loss stops improving.
-                        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10)
+                        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5)
 
                         val_among_epochs = []
                         train_among_epochs = []
@@ -275,8 +334,13 @@ if __name__ == '__main__':
                             # Evaluate on validation set
                             model.eval()
 
-                            output, val_loss = test(adj_val[0], features_val[0], y_val[0])
-                            val_loss = float(val_loss.detach().cpu().numpy())
+                            if isinstance(model, ATMGNN_Diff):
+                                with torch.no_grad():
+                                    val_loss = float(model.compute_diffusion_loss(adj_val[0], features_val[0], y_val[0]).item())
+                                output = y_val[0]
+                            else:
+                                output, val_loss = test(adj_val[0], features_val[0], y_val[0])
+                                val_loss = float(val_loss.detach().cpu().numpy())
 
 
                             # Print results
@@ -305,13 +369,13 @@ if __name__ == '__main__':
 
                             # Early-stop if validation loss hasn't changed in the last 20 epochs (training stalled).
                             if(epoch<30 and epoch>10):
-                                if(len(set([round(val_e, -1) for val_e in val_among_epochs[-20:]])) == 1 ):
+                                if(len(set([round(val_e, 1) for val_e in val_among_epochs[-20:]])) == 1 ):
                                     stop = False
                                     break
 
-                            # Early-stop if validaion loss hasn't changed in the last 50 epochs (fully converged).
-                            if( epoch>args.early_stop):
-                                if(len(set([round(val_e, -1) for val_e in val_among_epochs[-50:]])) == 1):
+                            # Early-stop if validation loss hasn't changed in the last args.early_stop epochs (fully converged).
+                            if epoch > args.early_stop:
+                                if(len(set([round(val_e, 1) for val_e in val_among_epochs[-args.early_stop:]])) == 1):
                                     print("\n      [EARLY STOP] Converged at epoch {}.".format(epoch + 1))
                                     break
 
@@ -319,6 +383,10 @@ if __name__ == '__main__':
 
                             scheduler.step(val_loss)
 
+                    # Capture training loss curves from shift=0 for the loss-curve plot.
+                    # Overwrites each test_sample so the final (most training data) run is stored.
+                    if shift == 0 and 'train_among_epochs' in dir() and len(train_among_epochs) > 0:
+                        _loss_history = (list(train_among_epochs), list(val_among_epochs))
 
                     # === TESTING ===
 
@@ -348,6 +416,8 @@ if __name__ == '__main__':
 
                     o = output.cpu().detach().numpy()
                     l = y_test[0].cpu().numpy()
+                    o = np.expm1(o)
+                    l = np.expm1(l)
                     
                     # Mean absolute error (MAE) averaged over all regions for this test day.
                     error = np.sum(abs(o-l))/n_nodes
@@ -383,6 +453,10 @@ if __name__ == '__main__':
                     np.sqrt(mean_squared_error(y_true, y_pred)),
                     r2_score(y_true, y_pred)))
 
+                # Store mean-across-regions daily signals for predictions vs actuals plot.
+                if y_pred.shape[1] > 0:
+                    _pred_store[shift] = (y_pred.mean(axis=0), y_true.mean(axis=0))
+
                 # Write metrics to CSV and save raw prediction/truth arrays to disk.
                 with open("../results/results_"+country+"_temporal.csv", "a") as fw:
                     fw.write(str(args.model)+"_AGW_MMR_"+str(args.rand_weights)+","+str(shift)+",{:.5f}".format(np.mean(result))+",{:.5f}".format(np.std(result))+",{:.5f}".format(mean_absolute_error(y_true, y_pred))+",{:.5f}".format(mean_squared_error(y_true, y_pred))+",{:.5f}".format(np.sqrt(mean_squared_error(y_true, y_pred)))+",{:.5f}".format(r2_score(y_true, y_pred))+"\n")
@@ -391,3 +465,16 @@ if __name__ == '__main__':
                 if y_uncert.shape[1] > 0:
                     np.savetxt("../Predictions/uncertainty_{}_shift{}_{}.csv".format(args.model, shift, country), y_uncert, fmt="%.5f", delimiter=',')
                 print("    Predictions saved to ../Predictions/")
+
+            # === POST-TRAINING PLOTS ===
+            
+            # Generate one loss-curve plot and one predictions-vs-actuals grid per (model, country).
+            print("\n[PLOT] Generating training plots for {} on {}...".format(args.model, country))
+            if _loss_history is not None:
+                _plot_loss_curve(_loss_history[0], _loss_history[1], args.model, country, '../figures/training')
+            else:
+                print('  [PLOT] No loss history captured (all runs may have been skipped).')
+            if _pred_store:
+                _plot_predictions_vs_actuals(_pred_store, args.model, country, '../figures/training')
+            else:
+                print('  [PLOT] No predictions captured for plot.')

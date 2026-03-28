@@ -332,8 +332,9 @@ def generate_new_features(Gs, labels, dates, window=7, scaled=False):
         H = np.zeros([G.number_of_nodes(), window + 4])
 
         # Per-region mean and std. deviation of all past cases (used only when scaled = True).
-        me = labs.loc[:, dates[:(idx)]].mean(1)
-        sd = labs.loc[:, dates[:(idx)]].std(1)+1   # +1 avoids division by zero
+        # fillna(0) guards against NaN when idx is 0 or 1 (too few history points for std).
+        me = labs.loc[:, dates[:(idx)]].mean(1).fillna(0)
+        sd = labs.loc[:, dates[:(idx)]].std(1).fillna(0) + 1   # +1 avoids division by zero
 
         # Enumerates because the row index of 'H' and the node name in 'labs' don't match directly.
         for i,node in enumerate(G.nodes()):
@@ -341,13 +342,13 @@ def generate_new_features(Gs, labels, dates, window=7, scaled=False):
                 if(scaled):
                     H[i,(window-idx):(window)] = (labs.loc[node, dates[0:(idx)]] - me[node])/ sd[node]
                 else:
-                    H[i,(window-idx):(window)] = labs.loc[node, dates[0:(idx)]]
+                    H[i,(window-idx):(window)] = np.log1p(labs.loc[node, dates[0:(idx)]].values)
 
             elif idx >= window:   # full window available, hence, fill all columns
                 if(scaled):
                     H[i,0:(window)] =  (labs.loc[node, dates[(idx-window):(idx)]] - me[node])/ sd[node]
                 else:
-                    H[i,0:(window)] = labs.loc[node, dates[(idx-window):(idx)]]
+                    H[i,0:(window)] = np.log1p(labs.loc[node, dates[(idx-window):(idx)]].values)
 
             # Append the fitted SEIR state for this region at the current day.
             H[i, window:] = seir_cache[node][idx]
@@ -412,11 +413,11 @@ def generate_new_batches(Gs, features, y, idx, graph_window, shift, batch_size, 
             # Ensures that during testing, no peeking occurs beyond the last known day. Hence, final label is repeated instead.
             if(test_sample>0):
                 if(val+shift<test_sample):
-                    y_tmp[(n_nodes*e1):(n_nodes*(e1+1))] = y[val+shift]
+                    y_tmp[(n_nodes*e1):(n_nodes*(e1+1))] = np.log1p(y[val+shift])
                 else:
-                    y_tmp[(n_nodes*e1):(n_nodes*(e1+1))] = y[val]
+                    y_tmp[(n_nodes*e1):(n_nodes*(e1+1))] = np.log1p(y[val])
             else:
-                y_tmp[(n_nodes*e1):(n_nodes*(e1+1))] = y[val+shift]
+                y_tmp[(n_nodes*e1):(n_nodes*(e1+1))] = np.log1p(y[val+shift])
         
         # Merge all daily adjacency matrices into one huge block-diagonal sparse matrix.
         adj_tmp = sp.block_diag(adj_tmp)

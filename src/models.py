@@ -147,8 +147,9 @@ class ATMGNN(nn.Module):
 
         # With 2 coarsening levels and the bottom (finest) level, we have 3 x 'nhidden' features per node.
         # Two layers that blend information from all coarseness levels into one representation.
-        self.mix_1 = nn.Linear((len(self.num_clusters) + 1) * nhidden, 512) # expand to identify cross-resolution interactions
-        self.mix_2 = nn.Linear(512, (len(self.num_clusters) + 1) * nhidden) # compress back to discard noise
+        _mix_hidden = 4 * nhidden
+        self.mix_1 = nn.Linear((len(self.num_clusters) + 1) * nhidden, _mix_hidden) # expand to identify cross-resolution interactions
+        self.mix_2 = nn.Linear(_mix_hidden, (len(self.num_clusters) + 1) * nhidden) # compress back to discard noise
 
         # Lets each timestep decide how much to pay attention to every other timestep via voting.
         self.self_attention = nn.MultiheadAttention((len(self.num_clusters) + 1) * nhidden, self.nhead, dropout=dropout)
@@ -215,7 +216,9 @@ class ATMGNN(nn.Module):
 
             # Shrinks the adjacency matrix to only describe connections between clusters.
             adj = torch.matmul(torch.matmul(assign.transpose(0, 1), adj), assign)
-            adj = adj / torch.sum(adj)
+            # Row-wise normalisation: each cluster's outgoing weights sum to 1 as dividing by the global sum would collapse all values near zero for dense graphs.
+            row_sums = adj.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            adj = adj / row_sums
 
             # Computes new cluster embeddings using a simple graph convolution on the coarse graph.
             latent = torch.tanh(self.middle_encoder[level](torch.matmul(adj, x)))
@@ -482,7 +485,7 @@ class ATMGNN_Diff(ATMGNN):
         and whose spread is the confidence interval.
     """
 
-    def __init__(self, nfeat, nhidden, nout, n_nodes, window, dropout, nhead=1, num_clusters=[10, 5], use_norm=False, diffusion_steps=8, decoder_hidden=128):
+    def __init__(self, nfeat, nhidden, nout, n_nodes, window, dropout, nhead=1, num_clusters=[10, 5], use_norm=False, diffusion_steps=100, decoder_hidden=64):
         """
             ARGS:
                 nfeat           (int): Number of input features per node per timestep.
@@ -541,4 +544,9 @@ class ATMGNN_Diff(ATMGNN):
         cond = self.encode(adj, x)
         if y_target.dim() == 1:
             y_target = y_target.unsqueeze(-1)
-        return self.diffusion.compute_loss(y_target, cond)
+        diffusion_loss = self.diffusion.compute_loss(y_target, cond)
+        direct = self.relu(self.fc1(cond))
+        direct = self.dropout(direct)
+        direct = self.relu(self.fc2(direct)).squeeze(-1).view(-1)
+        aux_loss = F.mse_loss(direct, y_target.squeeze(-1).view(-1))
+        return diffusion_loss + 0.1 * aux_loss
