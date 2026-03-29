@@ -374,7 +374,7 @@ class DiffusionDecoder(nn.Module):
         )
 
         # Linear beta schedule
-        betas = torch.linspace(1e-4, 0.02, self.T)
+        betas = torch.linspace(1e-4, 0.1, self.T)
         alphas = 1.0 - betas
         alpha_bar = torch.cumprod(alphas, dim=0)
 
@@ -524,19 +524,24 @@ class ATMGNN_Diff(ATMGNN):
                 torch.Tensor: If n_samples == 1 -> [batch*n_nodes] (matches ATMGNN output shape). If n_samples >  1 -> [n_samples, batch*n_nodes].
         """
         cond = self.encode(adj, x)
-        samples = self.diffusion.sample(cond, n_samples=n_samples)
         if n_samples == 1:
-            return samples.squeeze(-1).view(-1)
+            # Direct prediction via the inherited fc head: deterministic, stable point forecast.
+            out = self.relu(self.fc1(cond))
+            out = self.dropout(out)
+            return self.relu(self.fc2(out)).squeeze().view(-1)
+        # Diffusion sampling for uncertainty quantification (n_samples > 1).
+        samples = self.diffusion.sample(cond, n_samples=n_samples)
         return samples.squeeze(-1)
 
-    def compute_diffusion_loss(self, adj, x, y_target):
+    def compute_diffusion_loss(self, adj, x, y_target, node_weights=None):
         """
             Training path: encode the input then compute the DDPM denoising loss.
 
             ARGS:
-                adj      (torch.sparse_coo_tensor): Batch adjacency matrix.
-                x        (torch.Tensor): Batch node features.
-                y_target (torch.Tensor): Ground-truth target values of shape: [batch*n_nodes].
+                adj          (torch.sparse_coo_tensor): Batch adjacency matrix.
+                x            (torch.Tensor): Batch node features.
+                y_target     (torch.Tensor): Ground-truth target values of shape: [batch*n_nodes].
+                node_weights (torch.Tensor | None): Per-node loss weights for scale balancing.
 
             RETURNS:
                 torch.Tensor: Scalar denoising loss.
@@ -548,5 +553,10 @@ class ATMGNN_Diff(ATMGNN):
         direct = self.relu(self.fc1(cond))
         direct = self.dropout(direct)
         direct = self.relu(self.fc2(direct)).squeeze(-1).view(-1)
-        aux_loss = F.mse_loss(direct, y_target.squeeze(-1).view(-1))
+        y_flat = y_target.squeeze(-1).view(-1)
+        if node_weights is not None:
+            w = node_weights.repeat(direct.size(0) // node_weights.size(0))
+            aux_loss = (w * (direct - y_flat) ** 2).mean()
+        else:
+            aux_loss = F.mse_loss(direct, y_flat)
         return diffusion_loss + 0.1 * aux_loss

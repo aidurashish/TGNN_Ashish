@@ -31,15 +31,16 @@ import matplotlib.pyplot as plt
 # Weight controlling the relative importance of the SEIR biological consistency penalty.
 SEIR_LAMBDA = 0.1
 
-def train(adj, features, y):
+def train(adj, features, y, node_weights=None):
     """
     Runs one forward pass and backward pass and updates the model weights.
     Supports both the deterministic ATMGNN head and the DDPM diffusion decoder.
 
     ARGS:
-        adj      (torch.sparse_coo_tensor): Batch adjacency matrix.
-        features (torch.FloatTensor): Batch node feature matrix.
-        y        (torch.FloatTensor): Ground-truth target values for this batch.
+        adj          (torch.sparse_coo_tensor): Batch adjacency matrix.
+        features     (torch.FloatTensor): Batch node feature matrix.
+        y            (torch.FloatTensor): Ground-truth target values for this batch.
+        node_weights (torch.FloatTensor | None): Per-node loss weights for scale balancing.
 
     RETURNS:
         output     (torch.Tensor): Model predictions for this batch.
@@ -51,7 +52,7 @@ def train(adj, features, y):
     if isinstance(model, ATMGNN_Diff):
         
         # Diffusion training: epsilon-prediction loss on encoder conditioning.
-        loss_train = model.compute_diffusion_loss(adj, features, y)
+        loss_train = model.compute_diffusion_loss(adj, features, y, node_weights=node_weights)
         loss_train.backward()
         for p in model.parameters():
             if p.grad is not None:
@@ -63,7 +64,12 @@ def train(adj, features, y):
         output = y
     else:
         output = model(adj, features)
-        loss_mse = F.mse_loss(output, y)
+        if node_weights is not None:
+            # Tile weights to match batch: output may contain multiple samples * n_nodes.
+            w = node_weights.repeat(output.size(0) // node_weights.size(0))
+            loss_mse = (w * (output - y) ** 2).mean()
+        else:
+            loss_mse = F.mse_loss(output, y)
         
         # SEIR consistency penalty (predicted case counts cannot be negative).
         seir_penalty = F.relu(-output).mean()
@@ -78,14 +84,15 @@ def train(adj, features, y):
     return output, loss_train
 
 
-def test(adj, features, y):
+def test(adj, features, y, node_weights=None):
     """
         Runs a forward pass without updating weights, used for validation and testing.
 
         ARGS:
-            adj      (torch.sparse_coo_tensor): Batch adjacency matrix.
-            features (torch.FloatTensor): Batch node feature matrix.
-            y        (torch.FloatTensor): Ground-truth target values for this batch.
+            adj          (torch.sparse_coo_tensor): Batch adjacency matrix.
+            features     (torch.FloatTensor): Batch node feature matrix.
+            y            (torch.FloatTensor): Ground-truth target values for this batch.
+            node_weights (torch.FloatTensor | None): Per-node loss weights for scale balancing.
 
         RETURNS:
             output    (torch.Tensor): Model predictions for this batch.
@@ -94,7 +101,11 @@ def test(adj, features, y):
     
     with torch.no_grad():
         output = model(adj, features)
-        loss_test = F.mse_loss(output, y)
+        if node_weights is not None:
+            w = node_weights.repeat(output.size(0) // node_weights.size(0))
+            loss_test = (w * (output - y) ** 2).mean()
+        else:
+            loss_test = F.mse_loss(output, y)
     return output, loss_test
 
 
@@ -224,6 +235,12 @@ if __name__ == '__main__':
         print("  Country: {}  |  Nodes: {}  |  Days available: {}".format(country, n_nodes, n_samples))
         print("-"*60)
 
+        # Per-node inverse-frequency weights: regions with larger mean case counts receive less weight so the loss is balanced across all scales.
+        mean_cases = labels.values.astype(float).mean(axis=1)  # mean daily cases per region
+        inv_weights = 1.0 / (np.log1p(mean_cases) + 1.0)      # inverse of log-scale magnitude
+        inv_weights = inv_weights / inv_weights.mean()          # normalise so mean weight = 1
+        node_weights = torch.FloatTensor(inv_weights).to(device)
+
         # Create output directories if they don't exist yet.
         if not os.path.exists('../results'):
             os.makedirs('../results')
@@ -282,13 +299,15 @@ if __name__ == '__main__':
                     idx_train = idx_train+list(range(test_sample-args.sep+1,test_sample,2))
 
                     # Convert index lists into batched tensors for train, val, and test.
-                    adj_train, features_train, y_train = generate_new_batches(gs_adj, features, y, idx_train, args.graph_window, shift, args.batch_size,device,test_sample, decay=args.edge_decay)
+                    # Augment training with time-reversed samples for all countries
+                    _augment = True
+                    adj_train, features_train, y_train = generate_new_batches(gs_adj, features, y, idx_train, args.graph_window, shift, args.batch_size,device,test_sample, decay=args.edge_decay, augment_reverse=_augment)
                     adj_val, features_val, y_val = generate_new_batches(gs_adj, features, y, idx_val, args.graph_window,  shift,args.batch_size, device,test_sample, decay=args.edge_decay)
                     
                     # Test is always a single day, i.e., the current test_sample.
                     adj_test, features_test, y_test = generate_new_batches(gs_adj, features, y,  [test_sample], args.graph_window,shift, args.batch_size, device,test_sample, decay=args.edge_decay)
 
-                    n_train_batches = ceil(len(idx_train)/args.batch_size)
+                    n_train_batches = ceil((len(idx_train) * (2 if _augment else 1))/args.batch_size)
                     n_val_batches = 1   # validation is always one batch (one day)
                     n_test_batches = 1  # test is always one batch (one day)
 
@@ -307,11 +326,23 @@ if __name__ == '__main__':
                             stop = True
                             break
                         if args.model == "ATMGNN_Diff":
-                            model = ATMGNN_Diff(nfeat=nfeat, nhidden=args.hidden, nout=1, n_nodes=n_nodes, window=args.graph_window, dropout=args.dropout, nhead=1, diffusion_steps=args.diffusion_steps).to(device)
+                            model = ATMGNN_Diff(nfeat=nfeat, nhidden=args.hidden, nout=1, n_nodes=n_nodes, window=args.graph_window, dropout=args.dropout, nhead=1, diffusion_steps=args.diffusion_steps, decoder_hidden=128).to(device)
+                            # Warm-start the encoder from the already-trained ATMGNN checkpoint.
+                            _atmgnn_ckpt = '../Checkpoints/model_best_ATMGNN_shift{}_{}_RW_{}_seed{}_AG.pth.tar'.format(shift, country, args.rand_weights, args.rand_seed)
+                            if os.path.exists(_atmgnn_ckpt):
+                                _src = torch.load(_atmgnn_ckpt, weights_only=False)['state_dict']
+                                _dst = model.state_dict()
+                                _dst.update({k: v for k, v in _src.items() if not k.startswith('diffusion.')})
+                                model.load_state_dict(_dst)
+                                # Freeze only the heavy GCN backbone; let mix, attention, and fc layers fine-tune alongside the diffusion decoder for better conditioning.
+                                _frozen_prefixes = ('bottom_encoder.', 'middle_encoder.', 'middle_linear.')
+                                for name, param in model.named_parameters():
+                                    if name.startswith(_frozen_prefixes):
+                                        param.requires_grad_(False)
                         else:
                             model = ATMGNN(nfeat=nfeat, nhidden=args.hidden, nout=1, n_nodes=n_nodes, window=args.graph_window, dropout=args.dropout, nhead=1).to(device)
 
-                        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+                        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
                         
                         # Reduce learning rate when validation loss stops improving.
                         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5)
@@ -328,7 +359,7 @@ if __name__ == '__main__':
 
                             # Train for one epoch
                             for batch in range(n_train_batches):
-                                output, loss = train(adj_train[batch], features_train[batch], y_train[batch])
+                                output, loss = train(adj_train[batch], features_train[batch], y_train[batch], node_weights=node_weights)
                                 train_loss.update(loss.data.item(), output.size(0))
 
                             # Evaluate on validation set
@@ -336,10 +367,10 @@ if __name__ == '__main__':
 
                             if isinstance(model, ATMGNN_Diff):
                                 with torch.no_grad():
-                                    val_loss = float(model.compute_diffusion_loss(adj_val[0], features_val[0], y_val[0]).item())
+                                    val_loss = float(model.compute_diffusion_loss(adj_val[0], features_val[0], y_val[0], node_weights=node_weights).item())
                                 output = y_val[0]
                             else:
-                                output, val_loss = test(adj_val[0], features_val[0], y_val[0])
+                                output, val_loss = test(adj_val[0], features_val[0], y_val[0], node_weights=node_weights)
                                 val_loss = float(val_loss.detach().cpu().numpy())
 
 
@@ -369,13 +400,13 @@ if __name__ == '__main__':
 
                             # Early-stop if validation loss hasn't changed in the last 20 epochs (training stalled).
                             if(epoch<30 and epoch>10):
-                                if(len(set([round(val_e, 1) for val_e in val_among_epochs[-20:]])) == 1 ):
+                                if(len(set([round(val_e, 2) for val_e in val_among_epochs[-20:]])) == 1 ):
                                     stop = False
                                     break
 
                             # Early-stop if validation loss hasn't changed in the last args.early_stop epochs (fully converged).
                             if epoch > args.early_stop:
-                                if(len(set([round(val_e, 1) for val_e in val_among_epochs[-args.early_stop:]])) == 1):
+                                if(len(set([round(val_e, 2) for val_e in val_among_epochs[-args.early_stop:]])) == 1):
                                     print("\n      [EARLY STOP] Converged at epoch {}.".format(epoch + 1))
                                     break
 
@@ -404,19 +435,18 @@ if __name__ == '__main__':
                     optimizer.load_state_dict(checkpoint['optimizer'])
                     model.eval()
 
-                    # Multi-sample inference for diffusion model 
-                    if args.model == "ATMGNN_Diff" and args.num_samples > 1:
+                    # Point forecast always via the direct fc head (deterministic, stable).
+                    output, loss = test(adj_test[0], features_test[0], y_test[0])
+                    # Diffusion sampling for uncertainty estimation (ATMGNN_Diff only).
+                    uncertainty = None
+                    if isinstance(model, ATMGNN_Diff) and args.num_samples > 1:
                         with torch.no_grad():
-                            samples = model(adj_test[0], features_test[0], n_samples=args.num_samples)
-                            output = samples.mean(dim=0)
-                            uncertainty = samples.std(dim=0)
-                    else:
-                        output, loss = test(adj_test[0], features_test[0], y_test[0])
-                        uncertainty = None
+                            diff_samples = model(adj_test[0], features_test[0], n_samples=args.num_samples)
+                            uncertainty = diff_samples.std(dim=0)
 
-                    o = output.cpu().detach().numpy()
+                    o_log = output.cpu().detach().numpy()   # fc head output in log1p space
                     l = y_test[0].cpu().numpy()
-                    o = np.expm1(o)
+                    o = np.expm1(np.clip(o_log, 0.0, 10.0))
                     l = np.expm1(l)
                     
                     # Mean absolute error (MAE) averaged over all regions for this test day.
@@ -430,9 +460,12 @@ if __name__ == '__main__':
                     y_pred = np.append(y_pred, o.reshape(-1,1), axis=1)
                     y_true = np.append(y_true, l.reshape(-1,1), axis=1)
 
-                    # Append per-node uncertainty (standard deviation across samples).
+                    # Append per-node uncertainty
                     if uncertainty is not None:
-                        y_uncert = np.append(y_uncert, uncertainty.cpu().numpy().reshape(-1,1), axis=1)
+                        u_log = uncertainty.cpu().numpy()
+                        u_cases = (np.expm1(np.clip(o_log + u_log, 0.0, 10.0))
+                                   - np.expm1(np.clip(o_log - u_log, 0.0, 10.0))) / 2.0
+                        y_uncert = np.append(y_uncert, u_cases.reshape(-1,1), axis=1)
 
                     # Free per-day GPU tensors and release cached VRAM between iterations.
                     del adj_train, features_train, y_train

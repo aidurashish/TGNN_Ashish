@@ -97,6 +97,66 @@ def _fit_seir_to_region(case_counts):
     return np.clip(trajectory, 0.0, 1.0)
 
 
+def _backfill_late_starters(labels):
+    """For regions whose first nonzero report arrives after day 0, backfill the silent leading period using an exponential decay estimated from the regions that were already reporting during the same window."""
+    fixed = labels.copy().astype(float)
+    vals  = fixed.values.copy()
+
+    # Mean daily log-growth rate of regions that reported from day 0.
+    early_rates = []
+    for row in vals:
+        nz = np.where(row > 0)[0]
+        if len(nz) > 0 and nz[0] == 0 and nz[-1] > 0:
+            log_seg = np.log1p(row[:nz[-1] + 1])
+            if len(log_seg) > 1:
+                early_rates.append(np.mean(np.diff(log_seg)))
+    if not early_rates:
+        return fixed  # nothing to do
+    mean_growth = np.mean(early_rates)
+
+    for i, region in enumerate(fixed.index):
+        row = vals[i].copy()
+        nz  = np.where(row > 0)[0]
+        if len(nz) == 0 or nz[0] == 0:
+            continue  # already starts from day 0
+        first_nz = nz[0]
+        # Backfill day first_nz-1 down to 0 using inverse exponential growth.
+        for day in range(first_nz - 1, -1, -1):
+            row[day] = max(1.0, np.round(row[day + 1] * np.exp(-mean_growth)))
+        fixed.iloc[i] = row
+
+    return fixed
+
+
+def _interpolate_reporting_gaps(labels):
+    """Linearly interpolate interior zero values in each region's time series."""
+    fixed = labels.copy().astype(float)
+    for region in fixed.index:
+        row = fixed.loc[region].values.copy()
+        nonzero_idx = np.where(row > 0)[0]
+        if len(nonzero_idx) < 2:
+            continue
+        first_nz, last_nz = nonzero_idx[0], nonzero_idx[-1]
+        x = np.arange(len(row))
+        interior_zeros = (row == 0) & (x > first_nz) & (x < last_nz)
+        if not interior_zeros.any():
+            continue
+        row_interp = np.interp(x, x[row > 0], row[row > 0])
+        row[interior_zeros] = np.round(row_interp[interior_zeros])
+        fixed.loc[region] = np.maximum(row, 0)
+    return fixed
+
+
+def _smooth_batch_reporting(labels, window=3):
+    """Apply a rolling median filter to smooth batch-reporting spikes."""
+    fixed = labels.copy().astype(float)
+    for region in fixed.index:
+        row = pd.Series(fixed.loc[region].values.copy())
+        smoothed = row.rolling(window, center=True, min_periods=1).median()
+        fixed.loc[region] = np.maximum(np.round(smoothed.values), 0)
+    return fixed
+
+
 def read_datasets(window, rand_weight=False):
     """
         Loads graph and label data for all four countries in the dataset.
@@ -134,7 +194,8 @@ def read_datasets(window, rand_weight=False):
     # Build one graph per day, keeping only regions and dates present in both the graph and labels.
     Gs =generate_graphs(dates,"IT",rand_weight) 
     labels = labels.loc[list(Gs[0].nodes()),:]
-    labels = labels.loc[:,dates]    
+    labels = labels.loc[:,dates]
+    labels = _smooth_batch_reporting(labels)
     
     final_labels.append(labels)
     
@@ -172,6 +233,9 @@ def read_datasets(window, rand_weight=False):
     Gs =generate_graphs(dates,"ES",rand_weight)
     labels = labels.loc[list(Gs[0].nodes()),:]
     labels = labels.loc[:,dates]    #labels.sum(1).values>10
+    labels = _backfill_late_starters(labels)
+    labels = _interpolate_reporting_gaps(labels)
+    labels = _smooth_batch_reporting(labels)
 
     final_labels.append(labels)
 
@@ -206,7 +270,8 @@ def read_datasets(window, rand_weight=False):
     Gs =generate_graphs(dates,"EN",rand_weight)
     
     labels = labels.loc[list(Gs[0].nodes()),:]
-    labels = labels.loc[:,dates]    
+    labels = labels.loc[:,dates]
+    labels = _smooth_batch_reporting(labels)
     
     final_labels.append(labels)
 
@@ -239,7 +304,11 @@ def read_datasets(window, rand_weight=False):
     gs_adj = [nx.adjacency_matrix(kgs).toarray().T for kgs in Gs]
 
     labels = labels.loc[list(Gs[0].nodes()),:]
-    
+    labels = labels.loc[:,dates]
+    labels = _backfill_late_starters(labels)
+    labels = _interpolate_reporting_gaps(labels)
+    labels = _smooth_batch_reporting(labels)
+
     final_labels.append(labels)
 
     final_graphs.append(gs_adj)
@@ -314,7 +383,7 @@ def generate_new_features(Gs, labels, dates, window=7, scaled=False):
             scaled  (bool): Whether to standardise case counts by each region's historical mean and standard deviation.
 
         RETURNS:
-            list[np.ndarray]: One feature matrix per day of size: [n_nodes, window + 4]. The last four columns are the fitted SEIR state [S, E, I, R].
+            list[np.ndarray]: One feature matrix per day of size: [n_nodes, window + 5]. The next four columns are the fitted SEIR state [S, E, I, R], and the final column is the mean log-growth rate over the case-count window.
     """
     
     features = list()
@@ -328,8 +397,8 @@ def generate_new_features(Gs, labels, dates, window=7, scaled=False):
         seir_cache[node] = _fit_seir_to_region(case_counts)  # shape: [len(dates), 4]
 
     for idx,G in enumerate(Gs):
-        # Feature matrix: 'window' case-count columns + 4 SEIR compartment columns.
-        H = np.zeros([G.number_of_nodes(), window + 4])
+        # Feature matrix: 'window' case-count columns + 4 SEIR columns + 1 growth-rate column.
+        H = np.zeros([G.number_of_nodes(), window + 5])
 
         # Per-region mean and std. deviation of all past cases (used only when scaled = True).
         # fillna(0) guards against NaN when idx is 0 or 1 (too few history points for std).
@@ -343,36 +412,40 @@ def generate_new_features(Gs, labels, dates, window=7, scaled=False):
                     H[i,(window-idx):(window)] = (labs.loc[node, dates[0:(idx)]] - me[node])/ sd[node]
                 else:
                     H[i,(window-idx):(window)] = np.log1p(labs.loc[node, dates[0:(idx)]].values)
+                if idx > 1:
+                    H[i, window + 4] = np.mean(np.diff(H[i, (window-idx):window]))
 
             elif idx >= window:   # full window available, hence, fill all columns
                 if(scaled):
                     H[i,0:(window)] =  (labs.loc[node, dates[(idx-window):(idx)]] - me[node])/ sd[node]
                 else:
                     H[i,0:(window)] = np.log1p(labs.loc[node, dates[(idx-window):(idx)]].values)
+                H[i, window + 4] = np.mean(np.diff(H[i, 0:window]))
 
             # Append the fitted SEIR state for this region at the current day.
-            H[i, window:] = seir_cache[node][idx]
+            H[i, window:window+4] = seir_cache[node][idx]
 
         features.append(H)
         
     return features
 
 
-def generate_new_batches(Gs, features, y, idx, graph_window, shift, batch_size, device, test_sample, decay=0.5):
+def generate_new_batches(Gs, features, y, idx, graph_window, shift, batch_size, device, test_sample, decay=0.5, augment_reverse=False):
     """
         Packages graph data into batches ready to feed into the model for training.
 
         ARGS:
-            Gs           (list[sp.spmatrix]): List of sparse adjacency matrices, one per day.
-            features     (list[np.ndarray]): Node feature matrices, one per day.
-            y            (list): Target case counts, one list of values per day.
-            idx          (list[int]): Indices of days to include in these batches.
-            graph_window (int): How many consecutive days to stack into a single sample.
-            shift        (int): How many days ahead the model should predict.
-            batch_size   (int): Number of samples per batch.
-            device       (torch.device): CPU or GPU to send tensors to.
-            test_sample  (int): Last training-day index; used to avoid peeking at future labels during testing.
-            decay        (float): Exponential time decay rate applied to edge weights.
+            Gs              (list[sp.spmatrix]): List of sparse adjacency matrices, one per day.
+            features        (list[np.ndarray]): Node feature matrices, one per day.
+            y               (list): Target case counts, one list of values per day.
+            idx             (list[int]): Indices of days to include in these batches.
+            graph_window    (int): How many consecutive days to stack into a single sample.
+            shift           (int): How many days ahead the model should predict.
+            batch_size      (int): Number of samples per batch.
+            device          (torch.device): CPU or GPU to send tensors to.
+            test_sample     (int): Last training-day index; used to avoid peeking at future labels during testing.
+            decay           (float): Exponential time decay rate applied to edge weights.
+            augment_reverse (bool): If True, append a time-reversed copy of each sample to teach decline patterns.
 
         RETURNS:
             adj_lst      (list[torch.sparse_coo_tensor]): Block-diagonal adjacency tensors, one per batch.
@@ -380,7 +453,15 @@ def generate_new_batches(Gs, features, y, idx, graph_window, shift, batch_size, 
             y_lst        (list[torch.FloatTensor]): Target value tensors, one per batch.
     """
 
-    N = len(idx)
+    # If augmenting, double the index list: original + reversed copies.
+    if augment_reverse:
+        aug_idx = list(idx) + list(idx)  # second half will be reversed in feature assembly
+        aug_reversed = [False] * len(idx) + [True] * len(idx)
+    else:
+        aug_idx = list(idx)
+        aug_reversed = [False] * len(idx)
+
+    N = len(aug_idx)
     n_nodes = Gs[0].shape[0]
 
     adj_lst = list()
@@ -397,10 +478,15 @@ def generate_new_batches(Gs, features, y, idx, graph_window, shift, batch_size, 
 
         # Fill features and adjacency for each sample in the batch.
         for e1,j in enumerate(range(i, min(i+batch_size, N) )):
-            val = idx[j]
+            val = aug_idx[j]
+            is_rev = aug_reversed[j]
 
             # Stack 'graph_window' consecutive days of graphs and features for this sample.
-            for e2,k in enumerate(range(val-graph_window+1,val+1)):
+            day_indices = list(range(val-graph_window+1, val+1))
+            if is_rev:
+                day_indices = day_indices[::-1]  # reverse the temporal order
+
+            for e2, k in enumerate(day_indices):
                 # Compute how many steps back from the current day this snapshot is.
                 lag = graph_window - 1 - e2
 
