@@ -1,0 +1,5 @@
+country,label_missing_values,label_negative_counts,label_zero_counts,missing_graph_files,missing_graph_dates,extra_graph_files,graph_nodes_not_in_label,label_regions_not_in_graph,zero_edge_weights,negative_edge_weights
+England,0,0,18,0,,0,0,0,0,0
+France,0,0,456,0,,0,0,0,0,0
+Italy,0,0,21,0,,0,0,0,0,0
+Spain,0,0,325,0,,0,0,0,0,0

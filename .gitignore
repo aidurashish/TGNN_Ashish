@@ -8,10 +8,18 @@
 !/requirements.txt
 !/src/
 !/data/
+!/figures/
+!/Checkpoints/
+!/Predictions/
+!/results/
 
 # Unignore all contents inside the whitelisted directories
 !/src/**
 !/data/**
+!/figures/**
+!/Checkpoints/**
+!/Predictions/**
+!/results/**
 
 # Keep virtual environment ignored
 /.venv/
