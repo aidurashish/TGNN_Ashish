@@ -23,6 +23,7 @@ cadiz,malaga,84.0
 alicante,valencia,376.0
 sevilla,cordoba,255.0
 salamanca,salamanca,40161.0
+zamora,zamora,18736.0
 sevilla,sevilla,295428.0
 valencia,alicante,368.0
 leon,leon,53432.0
@@ -30,7 +31,12 @@ sevilla,cadiz,190.0
 cadiz,cadiz,151740.0
 cadiz,sevilla,179.0
 alicante,alicante,261335.0
+sevilla,huelva,265.0
 caceres,caceres,52164.0
+badajoz,badajoz,99655.0
+huelva,sevilla,274.0
+caceres,badajoz,41.0
+huelva,huelva,99189.0
 castellon,valencia,278.0
 castellon,tarragona,126.0
 tarragona,castellon,128.0
@@ -50,6 +56,7 @@ gipuzkoa,gipuzkoa,74956.0
 cuenca,cuenca,27761.0
 albacete,cuenca,73.0
 gipuzkoa,bizkaia,225.0
+almeria,almeria,108496.0
 gipuzkoa,araba/alava,25.0
 soria,soria,9249.0
 bizkaia,gipuzkoa,198.0
@@ -60,12 +67,15 @@ valencia,castellon,371.0
 bizkaia,bizkaia,113247.0
 bizkaia,araba/alava,92.0
 burgos,araba/alava,90.0
+almeria,granada,98.0
 bizkaia,burgos,51.0
+guadalajara,guadalajara,28742.0
 burgos,bizkaia,48.0
 ciudad_real,ciudad_real,69848.0
 granada,granada,131949.0
 toledo,cuenca,31.0
 toledo,ciudad_real,17.0
+granada,almeria,55.0
 granada,sevilla,37.0
 jaen,granada,39.0
 jaen,cordoba,37.0
@@ -74,6 +84,7 @@ cordoba,granada,10.0
 avila,segovia,35.0
 cordoba,malaga,45.0
 sevilla,malaga,69.0
+badajoz,caceres,47.0
 alicante,albacete,33.0
 lleida,barcelona,54.0
 cuenca,albacete,53.0
@@ -87,4 +98,3 @@ malaga,sevilla,32.0
 avila,toledo,10.0
 tarragona,lleida,11.0
 cuenca,ciudad_real,37.0
-zamora,zamora,18736.0

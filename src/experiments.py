@@ -20,7 +20,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from math import ceil
 from utils import generate_new_batches, AverageMeter, read_datasets
-from models import ATMGNN, ATMGNN_Diff
+from models import ATMGNN  # , ATMGNN_Diff
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import matplotlib
 matplotlib.use('Agg')   # non-interactive backend; safe for scripts with no display
@@ -49,37 +49,35 @@ def train(adj, features, y, node_weights=None):
     
     optimizer.zero_grad()
 
-    if isinstance(model, ATMGNN_Diff):
-        
-        # Diffusion training: epsilon-prediction loss on encoder conditioning.
-        loss_train = model.compute_diffusion_loss(adj, features, y, node_weights=node_weights)
-        loss_train.backward()
-        for p in model.parameters():
-            if p.grad is not None:
-                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        
-        # Return target as size placeholder
-        output = y
+    # if isinstance(model, ATMGNN_Diff):  # ATMGNN_Diff commented out
+    #     # Diffusion training: epsilon-prediction loss on encoder conditioning.
+    #     loss_train = model.compute_diffusion_loss(adj, features, y, node_weights=node_weights)
+    #     loss_train.backward()
+    #     for p in model.parameters():
+    #         if p.grad is not None:
+    #             torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+    #     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    #     optimizer.step()
+    #     # Return target as size placeholder
+    #     output = y
+    # else:
+    output = model(adj, features)
+    if node_weights is not None:
+        # Tile weights to match batch: output may contain multiple samples * n_nodes.
+        w = node_weights.repeat(output.size(0) // node_weights.size(0))
+        loss_mse = (w * (output - y) ** 2).mean()
     else:
-        output = model(adj, features)
-        if node_weights is not None:
-            # Tile weights to match batch: output may contain multiple samples * n_nodes.
-            w = node_weights.repeat(output.size(0) // node_weights.size(0))
-            loss_mse = (w * (output - y) ** 2).mean()
-        else:
-            loss_mse = F.mse_loss(output, y)
-        
-        # SEIR consistency penalty (predicted case counts cannot be negative).
-        seir_penalty = F.relu(-output).mean()
-        loss_train = loss_mse + SEIR_LAMBDA * seir_penalty
-        loss_train.backward()
-        for p in model.parameters():
-            if p.grad is not None:
-                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        loss_mse = F.mse_loss(output, y)
+    
+    # SEIR consistency penalty (predicted case counts cannot be negative).
+    seir_penalty = F.relu(-output).mean()
+    loss_train = loss_mse + SEIR_LAMBDA * seir_penalty
+    loss_train.backward()
+    for p in model.parameters():
+        if p.grad is not None:
+            torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
 
     return output, loss_train
 
@@ -164,23 +162,23 @@ def _plot_predictions_vs_actuals(pred_store, model_name, country, out_dir):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=75, help='Number of epochs.')
+    parser.add_argument('--epochs', type=int, default=300, help='Number of epochs.')
     parser.add_argument('--lr', type=float, default=0.001, help='Starting learning rate.')
-    parser.add_argument('--hidden', type=int, default=32, help='Number of hidden units.')
+    parser.add_argument('--hidden', type=int, default=64, help='Number of hidden units.')
     parser.add_argument('--batch-size', type=int, default=128, help='Size of batch.')
-    parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate.')
+    parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate.')
     parser.add_argument('--window', type=int, default=7, help='Size of window for features.')
     parser.add_argument('--graph-window', type=int, default=7, help='Size of window for graphs.')
-    parser.add_argument('--early-stop', type=int, default=30, help='How many epochs to wait before stopping.')
+    parser.add_argument('--early-stop', type=int, default=100, help='How many epochs to wait before stopping.')
     parser.add_argument('--start-exp', type=int, default=15, help='The first day to start the predictions.')
-    parser.add_argument('--ahead', type=int, default=7, help='The number of days ahead of the train set the predictions should reach.')
+    parser.add_argument('--ahead', type=int, default=21, help='The number of days ahead of the train set the predictions should reach.')
     parser.add_argument('--sep', type=int, default=10, help='Seperator for validation and train set.')
     parser.add_argument('--rand-weights', type=bool, default=False, help="True or False. Enable ablation where weights in the adjacency matrix are shuffled.")
     parser.add_argument('--rand-seed', type=int, default=0, help="Specify the random seeds for reproducibility.")
     parser.add_argument('--edge-decay', type=float, default=0.5, help='Exponential time decay for edge weights across the graph window (Set to 0.0 to disable decay).')
-    parser.add_argument('--model-name', type=str, default='ATMGNN_Diff', choices=['ATMGNN', 'ATMGNN_Diff'], help='Model architecture to train (ATMGNN = deterministic head, ATMGNN_Diff = diffusion decoder).')
-    parser.add_argument('--diffusion-steps', type=int, default=100, help='Number of DDPM denoising steps T (only used with ATMGNN_Diff).')
-    parser.add_argument('--num-samples', type=int, default=10, help='Number of diffusion samples at inference for uncertainty estimation (only used with ATMGNN_Diff).')
+    # parser.add_argument('--model-name', type=str, default='ATMGNN_Diff', choices=['ATMGNN', 'ATMGNN_Diff'], help='Model architecture to train (ATMGNN = deterministic head, ATMGNN_Diff = diffusion decoder).')  # ATMGNN_Diff commented out
+    # parser.add_argument('--diffusion-steps', type=int, default=100, help='Number of DDPM denoising steps T (only used with ATMGNN_Diff).')  # ATMGNN_Diff commented out
+    # parser.add_argument('--num-samples', type=int, default=10, help='Number of diffusion samples at inference for uncertainty estimation (only used with ATMGNN_Diff).')  # ATMGNN_Diff commented out
     
     args = parser.parse_args()
     
@@ -192,10 +190,10 @@ if __name__ == '__main__':
     # Use GPU if available, otherwise fall back to CPU.
     device = torch.device("cuda" if torch.cuda.is_available() else torch.device("cpu"))
     print("\n" + "="*60)
-    print("  TGNN Training Run")
+    print("  ATMGNN Training Run")
     print("="*60)
     print("  Device      : {}".format(device))
-    print("  Models      : ATMGNN, ATMGNN_Diff")
+    print("  Models      : ATMGNN")
     print("  Countries   : IT, ES, EN, FR")
     print("  Shifts      : 0 to {}".format(args.ahead - 1))
     print("  Epochs      : {} (early stop after {})".format(args.epochs, args.early_stop))
@@ -252,7 +250,7 @@ if __name__ == '__main__':
             os.makedirs('../figures/training')
 
         
-        for args.model in ['ATMGNN', 'ATMGNN_Diff']:   # Trains both models sequentially in one run
+        for args.model in ['ATMGNN']:  # ['ATMGNN', 'ATMGNN_Diff'] — ATMGNN_Diff commented out
             print("\n[MODEL] Starting training: {} on {}".format(args.model, country))
             _loss_history = None    # (train_losses, val_losses) from shift=0 last test_sample
             _pred_store = {}        # shift -> (mean_pred_per_day, mean_true_per_day)
@@ -277,7 +275,7 @@ if __name__ == '__main__':
                 result = []                                 # stores mean absolute error (MAE) per test day
                 y_pred = np.empty((n_nodes, 0), dtype=int)  # accumulates predictions column by column
                 y_true = np.empty((n_nodes, 0), dtype=int)  # accumulates ground-truth column by column
-                y_uncert = np.empty((n_nodes, 0), dtype=float)  # accumulates per-node uncertainty (std. deviation) for diffusion model
+                # y_uncert = np.empty((n_nodes, 0), dtype=float)  # ATMGNN_Diff only — commented out
                 y_val = []
                 exp = 0
 
@@ -325,22 +323,22 @@ if __name__ == '__main__':
                             print("\n    [WARN] Max restarts ({}) exceeded for test_sample={}. Using best checkpoint found.".format(max_restarts, test_sample))
                             stop = True
                             break
-                        if args.model == "ATMGNN_Diff":
-                            model = ATMGNN_Diff(nfeat=nfeat, nhidden=args.hidden, nout=1, n_nodes=n_nodes, window=args.graph_window, dropout=args.dropout, nhead=1, diffusion_steps=args.diffusion_steps, decoder_hidden=128).to(device)
-                            # Warm-start the encoder from the already-trained ATMGNN checkpoint.
-                            _atmgnn_ckpt = '../Checkpoints/model_best_ATMGNN_shift{}_{}_RW_{}_seed{}_AG.pth.tar'.format(shift, country, args.rand_weights, args.rand_seed)
-                            if os.path.exists(_atmgnn_ckpt):
-                                _src = torch.load(_atmgnn_ckpt, weights_only=False)['state_dict']
-                                _dst = model.state_dict()
-                                _dst.update({k: v for k, v in _src.items() if not k.startswith('diffusion.')})
-                                model.load_state_dict(_dst)
-                                # Freeze only the heavy GCN backbone; let mix, attention, and fc layers fine-tune alongside the diffusion decoder for better conditioning.
-                                _frozen_prefixes = ('bottom_encoder.', 'middle_encoder.', 'middle_linear.')
-                                for name, param in model.named_parameters():
-                                    if name.startswith(_frozen_prefixes):
-                                        param.requires_grad_(False)
-                        else:
-                            model = ATMGNN(nfeat=nfeat, nhidden=args.hidden, nout=1, n_nodes=n_nodes, window=args.graph_window, dropout=args.dropout, nhead=1).to(device)
+                        # if args.model == "ATMGNN_Diff":  # ATMGNN_Diff commented out
+                        #     model = ATMGNN_Diff(nfeat=nfeat, nhidden=args.hidden, nout=1, n_nodes=n_nodes, window=args.graph_window, dropout=args.dropout, nhead=1, diffusion_steps=args.diffusion_steps, decoder_hidden=128).to(device)
+                        #     # Warm-start the encoder from the already-trained ATMGNN checkpoint.
+                        #     _atmgnn_ckpt = '../Checkpoints/model_best_ATMGNN_shift{}_{}_RW_{}_seed{}_AG.pth.tar'.format(shift, country, args.rand_weights, args.rand_seed)
+                        #     if os.path.exists(_atmgnn_ckpt):
+                        #         _src = torch.load(_atmgnn_ckpt, weights_only=False)['state_dict']
+                        #         _dst = model.state_dict()
+                        #         _dst.update({k: v for k, v in _src.items() if not k.startswith('diffusion.')})
+                        #         model.load_state_dict(_dst)
+                        #         # Freeze only the heavy GCN backbone; let mix, attention, and fc layers fine-tune alongside the diffusion decoder for better conditioning.
+                        #         _frozen_prefixes = ('bottom_encoder.', 'middle_encoder.', 'middle_linear.')
+                        #         for name, param in model.named_parameters():
+                        #             if name.startswith(_frozen_prefixes):
+                        #                 param.requires_grad_(False)
+                        # else:
+                        model = ATMGNN(nfeat=nfeat, nhidden=args.hidden, nout=1, n_nodes=n_nodes, window=args.graph_window, dropout=args.dropout, nhead=1).to(device)
 
                         optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
                         
@@ -365,13 +363,13 @@ if __name__ == '__main__':
                             # Evaluate on validation set
                             model.eval()
 
-                            if isinstance(model, ATMGNN_Diff):
-                                with torch.no_grad():
-                                    val_loss = float(model.compute_diffusion_loss(adj_val[0], features_val[0], y_val[0], node_weights=node_weights).item())
-                                output = y_val[0]
-                            else:
-                                output, val_loss = test(adj_val[0], features_val[0], y_val[0], node_weights=node_weights)
-                                val_loss = float(val_loss.detach().cpu().numpy())
+                            # if isinstance(model, ATMGNN_Diff):  # ATMGNN_Diff commented out
+                            #     with torch.no_grad():
+                            #         val_loss = float(model.compute_diffusion_loss(adj_val[0], features_val[0], y_val[0], node_weights=node_weights).item())
+                            #     output = y_val[0]
+                            # else:
+                            output, val_loss = test(adj_val[0], features_val[0], y_val[0], node_weights=node_weights)
+                            val_loss = float(val_loss.detach().cpu().numpy())
 
 
                             # Print results
@@ -437,12 +435,12 @@ if __name__ == '__main__':
 
                     # Point forecast always via the direct fc head (deterministic, stable).
                     output, loss = test(adj_test[0], features_test[0], y_test[0])
-                    # Diffusion sampling for uncertainty estimation (ATMGNN_Diff only).
-                    uncertainty = None
-                    if isinstance(model, ATMGNN_Diff) and args.num_samples > 1:
-                        with torch.no_grad():
-                            diff_samples = model(adj_test[0], features_test[0], n_samples=args.num_samples)
-                            uncertainty = diff_samples.std(dim=0)
+                    # # Diffusion sampling for uncertainty estimation (ATMGNN_Diff only — commented out).
+                    # uncertainty = None
+                    # if isinstance(model, ATMGNN_Diff) and args.num_samples > 1:
+                    #     with torch.no_grad():
+                    #         diff_samples = model(adj_test[0], features_test[0], n_samples=args.num_samples)
+                    #         uncertainty = diff_samples.std(dim=0)
 
                     o_log = output.cpu().detach().numpy()   # fc head output in log1p space
                     l = y_test[0].cpu().numpy()
@@ -460,12 +458,12 @@ if __name__ == '__main__':
                     y_pred = np.append(y_pred, o.reshape(-1,1), axis=1)
                     y_true = np.append(y_true, l.reshape(-1,1), axis=1)
 
-                    # Append per-node uncertainty
-                    if uncertainty is not None:
-                        u_log = uncertainty.cpu().numpy()
-                        u_cases = (np.expm1(np.clip(o_log + u_log, 0.0, 10.0))
-                                   - np.expm1(np.clip(o_log - u_log, 0.0, 10.0))) / 2.0
-                        y_uncert = np.append(y_uncert, u_cases.reshape(-1,1), axis=1)
+                    # # Append per-node uncertainty (ATMGNN_Diff only — commented out)
+                    # if uncertainty is not None:
+                    #     u_log = uncertainty.cpu().numpy()
+                    #     u_cases = (np.expm1(np.clip(o_log + u_log, 0.0, 10.0))
+                    #                - np.expm1(np.clip(o_log - u_log, 0.0, 10.0))) / 2.0
+                    #     y_uncert = np.append(y_uncert, u_cases.reshape(-1,1), axis=1)
 
                     # Free per-day GPU tensors and release cached VRAM between iterations.
                     del adj_train, features_train, y_train
@@ -495,8 +493,8 @@ if __name__ == '__main__':
                     fw.write(str(args.model)+"_AGW_MMR_"+str(args.rand_weights)+","+str(shift)+",{:.5f}".format(np.mean(result))+",{:.5f}".format(np.std(result))+",{:.5f}".format(mean_absolute_error(y_true, y_pred))+",{:.5f}".format(mean_squared_error(y_true, y_pred))+",{:.5f}".format(np.sqrt(mean_squared_error(y_true, y_pred)))+",{:.5f}".format(r2_score(y_true, y_pred))+"\n")
                 np.savetxt("../Predictions/predict_{}_shift{}_{}.csv".format(args.model, shift, country), y_pred, fmt="%.5f", delimiter=',')
                 np.savetxt("../Predictions/truth_{}_shift{}_{}.csv".format(args.model, shift, country), y_true, fmt="%.5f", delimiter=',')
-                if y_uncert.shape[1] > 0:
-                    np.savetxt("../Predictions/uncertainty_{}_shift{}_{}.csv".format(args.model, shift, country), y_uncert, fmt="%.5f", delimiter=',')
+                # if y_uncert.shape[1] > 0:  # ATMGNN_Diff only — commented out
+                #     np.savetxt("../Predictions/uncertainty_{}_shift{}_{}.csv".format(args.model, shift, country), y_uncert, fmt="%.5f", delimiter=',')
                 print("    Predictions saved to ../Predictions/")
 
             # === POST-TRAINING PLOTS ===

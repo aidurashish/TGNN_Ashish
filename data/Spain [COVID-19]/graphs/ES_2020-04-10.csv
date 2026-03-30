@@ -1,6 +1,10 @@
 castellon,castellon,85567.0
 valencia,valencia,348857.0
 caceres,caceres,53748.0
+sevilla,huelva,91.0
+badajoz,badajoz,102916.0
+huelva,sevilla,113.0
+huelva,huelva,102662.0
 alicante,valencia,87.0
 alicante,alicante,259046.0
 valencia,alicante,81.0
@@ -17,11 +21,13 @@ girona,girona,123040.0
 albacete,albacete,54103.0
 gipuzkoa,gipuzkoa,77512.0
 cuenca,cuenca,29316.0
+almeria,almeria,112172.0
 bizkaia,gipuzkoa,14.0
 soria,soria,9736.0
 araba/alava,araba/alava,39118.0
 bizkaia,bizkaia,118302.0
 burgos,araba/alava,10.0
+guadalajara,guadalajara,30218.0
 ciudad_real,ciudad_real,72913.0
 granada,granada,133605.0
 burgos,burgos,35326.0
@@ -36,6 +42,7 @@ valladolid,valladolid,63845.0
 avila,avila,18701.0
 sevilla,cordoba,65.0
 salamanca,salamanca,41224.0
+zamora,zamora,19674.0
 sevilla,sevilla,303747.0
 leon,leon,55532.0
 cadiz,cadiz,155661.0
@@ -51,4 +58,3 @@ cadiz,sevilla,13.0
 sevilla,cadiz,11.0
 cuenca,albacete,11.0
 araba/alava,bizkaia,10.0
-zamora,zamora,19674.0
