@@ -165,7 +165,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=300, help='Number of epochs.')
     parser.add_argument('--lr', type=float, default=0.001, help='Starting learning rate.')
     parser.add_argument('--hidden', type=int, default=64, help='Number of hidden units.')
-    parser.add_argument('--batch-size', type=int, default=128, help='Size of batch.')
+    parser.add_argument('--batch-size', type=int, default=32, help='Size of batch.')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate.')
     parser.add_argument('--window', type=int, default=7, help='Size of window for features.')
     parser.add_argument('--graph-window', type=int, default=7, help='Size of window for graphs.')
