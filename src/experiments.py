@@ -171,7 +171,7 @@ if __name__ == '__main__':
     parser.add_argument('--graph-window', type=int, default=7, help='Size of window for graphs.')
     parser.add_argument('--early-stop', type=int, default=100, help='How many epochs to wait before stopping.')
     parser.add_argument('--start-exp', type=int, default=15, help='The first day to start the predictions.')
-    parser.add_argument('--ahead', type=int, default=21, help='The number of days ahead of the train set the predictions should reach.')
+    parser.add_argument('--ahead', type=int, default=7, help='The number of days ahead of the train set the predictions should reach.')
     parser.add_argument('--sep', type=int, default=10, help='Seperator for validation and train set.')
     parser.add_argument('--rand-weights', type=bool, default=False, help="True or False. Enable ablation where weights in the adjacency matrix are shuffled.")
     parser.add_argument('--rand-seed', type=int, default=0, help="Specify the random seeds for reproducibility.")
