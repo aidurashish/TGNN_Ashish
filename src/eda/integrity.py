@@ -18,7 +18,6 @@
 import sys
 import csv
 import pandas as pd
-from datetime import date, timedelta
 from pathlib import Path
 
 # Resolve project root regardless of where the script is called from 
@@ -36,23 +35,16 @@ COUNTRIES = {
     "Spain":   ("data/Spain [COVID-19]",   "spain_labels.csv",   "ES"),
 }
 
-# Expected dates
-def _expected_dates():
-    dates = []
-    d = date(2020, 3, 13)
-    while d <= date(2020, 5, 12):
-        dates.append(str(d))
-        d += timedelta(days=1)
-    return dates
-
-EXPECTED_DATES = _expected_dates()   # 61 dates
 
 
 # Helper Functions
 def load_labels(folder, label_file):
     path = PROJECT_ROOT / folder / label_file
     df = pd.read_csv(path, index_col=0)
-    return df   # index = region, columns = dates
+    if "name" in df.columns:          # Italy has extra 'name' and 'id' columns
+        df = df.set_index("name")
+    date_cols = [c for c in df.columns if str(c).startswith("20")]
+    return df[date_cols]   # index = region, columns = string dates
 
 
 def _graph_path(folder, prefix, date_str):
@@ -114,14 +106,17 @@ for country, (folder, label_file, prefix) in COUNTRIES.items():
     n_zero = int(zero_mask.sum().sum())
     print(f"  Zero case counts (days×regions)   : {n_zero}")
 
+    # Derive expected dates from the label CSV (per-country)
+    expected_dates = list(df.columns)
+
     # 4. Missing graph date files 
     graphs_dir = PROJECT_ROOT / folder / "graphs"
     present = {
         f.stem.replace(f"{prefix}_", "")
         for f in graphs_dir.glob(f"{prefix}_*.csv")
     }
-    missing_dates = [d for d in EXPECTED_DATES if d not in present]
-    extra_dates   = [d for d in sorted(present) if d not in EXPECTED_DATES]
+    missing_dates = [d for d in expected_dates if d not in present]
+    extra_dates   = [d for d in sorted(present) if d not in expected_dates]
     print(f"  Missing graph files               : {len(missing_dates)}" + (f"  → {missing_dates}" if missing_dates else ""))
     print(f"  Unexpected extra graph files      : {len(extra_dates)}" + (f"  → {extra_dates}" if extra_dates else ""))
 
@@ -130,7 +125,7 @@ for country, (folder, label_file, prefix) in COUNTRIES.items():
     
     # Collect all node names across all available graph files
     all_graph_nodes: set = set()
-    for d in EXPECTED_DATES:
+    for d in expected_dates:
         if d in present:
             all_graph_nodes |= graph_nodes_for_date(folder, prefix, d)
             
@@ -143,7 +138,7 @@ for country, (folder, label_file, prefix) in COUNTRIES.items():
     # 6. Zero/negative edge weights 
     n_zero_w = 0
     n_neg_w  = 0
-    for d in EXPECTED_DATES:
+    for d in expected_dates:
         if d in present:
             for src, dst, w in all_graph_edges(folder, prefix, d):
                 if w < 0:

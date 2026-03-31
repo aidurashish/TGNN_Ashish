@@ -18,7 +18,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import date, timedelta
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -40,35 +39,31 @@ PALETTE = {"England": "#1f77b4", "France": "#ff7f0e", "Italy": "#2ca02c",   "Spa
 MAX_LAG = 14
 
 # Helper functions
-def _expected_dates():
-    dates, d = [], date(2020, 3, 13)
-    while d <= date(2020, 5, 12):
-        dates.append(str(d))
-        d += timedelta(days=1)
-    return dates
-
-DATES = _expected_dates()
-N = len(DATES)
-
-
 def load_labels(folder, label_file):
     path = PROJECT_ROOT / folder / label_file
     df = pd.read_csv(path, index_col=0)
+    if "name" in df.columns:          # Italy has extra 'name' and 'id' columns
+        df = df.set_index("name")
+    date_cols = [c for c in df.columns if str(c).startswith("20")]
+    df = df[date_cols]
     df.columns = pd.to_datetime(df.columns)
     return df.clip(lower=0).astype(float)
 
 
-def load_inflow_per_region(folder, prefix, regions):
+def load_inflow_per_region(folder, prefix, regions, dates):
     """
         For each date, compute weighted in-flow to each region (sum of cross-region incoming edge weights).
-        
-        RETURNS: 
+
+        RETURNS:
             np.ndarray shape (n_regions, n_dates)
     """
+    n_dates    = len(dates)
     region_idx = {r: i for i, r in enumerate(regions)}
-    inflow = np.zeros((len(regions), N))
-    for t, d in enumerate(DATES):
+    inflow     = np.zeros((len(regions), n_dates))
+    for t, d in enumerate(dates):
         p = PROJECT_ROOT / folder / "graphs" / f"{prefix}_{d}.csv"
+        if not p.exists():
+            continue
         with open(p, newline="") as f:
             for row in csv.reader(f):
                 if len(row) >= 3:
@@ -81,19 +76,22 @@ def load_inflow_per_region(folder, prefix, regions):
     return inflow
 
 
-# Load all data ─
+# Load all data
 print("Loading data…")
 all_cases   = {}
 all_inflow  = {}
 regions_map = {}
+n_dates_map = {}   # per-country date count
 
 for country, (folder, lf, prefix) in COUNTRIES.items():
     print(f"  {country}…")
-    df = load_labels(folder, lf)
+    df      = load_labels(folder, lf)
     regions = list(df.index)
+    dates   = [str(d.date()) for d in df.columns]
     regions_map[country] = regions
-    all_cases[country]  = df.values.astype(float)   # (30, 61)
-    all_inflow[country] = load_inflow_per_region(folder, prefix, regions)  # (30, 61)
+    n_dates_map[country] = len(dates)
+    all_cases[country]   = df.values.astype(float)
+    all_inflow[country]  = load_inflow_per_region(folder, prefix, regions, dates)
 
 country_names = list(COUNTRIES.keys())
 
@@ -107,9 +105,10 @@ axes = axes.flatten()
 
 for ax, country in zip(axes, country_names):
     col    = PALETTE[country]
-    cases  = all_cases[country]   # (30, 61)
-    inflow = all_inflow[country]  # (30, 61)
+    cases  = all_cases[country]
+    inflow = all_inflow[country]
     R      = len(regions_map[country])
+    N      = n_dates_map[country]
 
     mean_r = []
     for k in lags:
@@ -150,12 +149,13 @@ fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 axes = axes.flatten()
 
 for ax, country in zip(axes, country_names):
-    col    = PALETTE[country]
-    k      = best_lag_per_country[country]
-    cases  = all_cases[country]
-    inflow = all_inflow[country]
+    col     = PALETTE[country]
+    k       = best_lag_per_country[country]
+    cases   = all_cases[country]
+    inflow  = all_inflow[country]
     regions = regions_map[country]
-    R = len(regions)
+    R       = len(regions)
+    N       = n_dates_map[country]
 
     cmap = plt.cm.get_cmap("tab20", R)
     for r, region in enumerate(regions):
@@ -182,7 +182,7 @@ fig, axes = plt.subplots(2, 2, figsize=(18, 16))
 axes = axes.flatten()
 
 for ax, country in zip(axes, country_names):
-    cases   = all_cases[country]   # (30, 61)
+    cases   = all_cases[country]
     regions = regions_map[country]
     R = len(regions)
     corr = np.corrcoef(cases)   # (30, 30)

@@ -16,7 +16,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from datetime import date, timedelta
 from pathlib import Path
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -39,29 +38,25 @@ COUNTRIES = {
 PALETTE = {"England": "#1f77b4", "France": "#ff7f0e", "Italy": "#2ca02c",   "Spain": "#d62728"}
 
 # Helper functions
-def _expected_dates():
-    dates, d = [], date(2020, 3, 13)
-    while d <= date(2020, 5, 12):
-        dates.append(str(d))
-        d += timedelta(days=1)
-    return dates
-
-DATES = _expected_dates()
-DATE_OBJS = [pd.Timestamp(d) for d in DATES]
-
-
 def load_labels(folder, label_file):
     path = PROJECT_ROOT / folder / label_file
     df = pd.read_csv(path, index_col=0)
+    if "name" in df.columns:          # Italy has extra 'name' and 'id' columns
+        df = df.set_index("name")
+    date_cols = [c for c in df.columns if str(c).startswith("20")]
+    df = df[date_cols]
     df.columns = pd.to_datetime(df.columns)
     return df.clip(lower=0)
 
 
-def load_cross_mobility(folder, prefix):
-    """Return array of total cross-region flow per day (length = 61)."""
+def load_cross_mobility(folder, prefix, dates):
+    """Return array of total cross-region flow per day (length = len(dates))."""
     totals = []
-    for d in DATES:
+    for d in dates:
         p = PROJECT_ROOT / folder / "graphs" / f"{prefix}_{d}.csv"
+        if not p.exists():
+            totals.append(0.0)
+            continue
         total = 0.0
         with open(p, newline="") as f:
             for row in csv.reader(f):
@@ -76,13 +71,19 @@ def load_cross_mobility(folder, prefix):
 
 # Load data
 print("Loading data…")
-cases_series = {}
+cases_series    = {}
 mobility_series = {}
+date_objs_by    = {}   # per-country list of Timestamps
+date_str_by     = {}   # per-country list of date strings
+
 for country, (folder, lf, prefix) in COUNTRIES.items():
     print(f"  Loading {country}…")
-    df = load_labels(folder, lf)
-    cases_series[country] = df.sum(axis=0).values.astype(float)
-    mobility_series[country] = load_cross_mobility(folder, prefix)
+    df   = load_labels(folder, lf)
+    dates_str = [str(d.date()) for d in df.columns]
+    cases_series[country]    = df.sum(axis=0).values.astype(float)
+    mobility_series[country] = load_cross_mobility(folder, prefix, dates_str)
+    date_objs_by[country]    = list(df.columns)
+    date_str_by[country]     = dates_str
 
 country_names = list(COUNTRIES.keys())
 
@@ -97,18 +98,19 @@ fig, axes = plt.subplots(2, 2, figsize=(16, 10))
 axes = axes.flatten()
 
 for ax, country in zip(axes, country_names):
-    col = PALETTE[country]
+    col   = PALETTE[country]
     cases = cases_series[country]
     mob   = mobility_series[country]
+    date_objs = date_objs_by[country]
 
     # Left axis — cases
-    ax.plot(DATE_OBJS, cases, color=col, linewidth=2.2, label="Daily new cases")
+    ax.plot(date_objs, cases, color=col, linewidth=2.2, label="Daily new cases")
     ax.set_ylabel("Daily new cases", color=col)
     ax.tick_params(axis="y", labelcolor=col)
 
     # Right axis — mobility
     ax2 = ax.twinx()
-    ax2.plot(DATE_OBJS, mob / 1e6, color=col, linewidth=1.8, linestyle="--", alpha=0.65, label="Cross-region flow")
+    ax2.plot(date_objs, mob / 1e6, color=col, linewidth=1.8, linestyle="--", alpha=0.65, label="Cross-region flow")
     ax2.set_ylabel("Cross-region flow (millions)", color="grey")
     ax2.tick_params(axis="y", labelcolor="grey")
 
@@ -135,14 +137,15 @@ fig, axes = plt.subplots(2, 2, figsize=(16, 10))
 axes = axes.flatten()
 
 for ax, country in zip(axes, country_names):
-    col = PALETTE[country]
+    col    = PALETTE[country]
+    date_objs = date_objs_by[country]
     c_norm = _minmax(cases_series[country])
     m_norm = _minmax(mobility_series[country])
 
-    ax.plot(DATE_OBJS, c_norm, color=col, linewidth=2.2, label="Cases (normalised)")
-    ax.plot(DATE_OBJS, m_norm, color=col, linewidth=1.8, linestyle="--",
+    ax.plot(date_objs, c_norm, color=col, linewidth=2.2, label="Cases (normalised)")
+    ax.plot(date_objs, m_norm, color=col, linewidth=1.8, linestyle="--",
             alpha=0.65, label="Mobility (normalised)")
-    ax.fill_between(DATE_OBJS, c_norm, m_norm, alpha=0.08, color=col)
+    ax.fill_between(date_objs, c_norm, m_norm, alpha=0.08, color=col)
 
     ax.set_title(country, fontsize=13, fontweight="bold")
     ax.set_ylabel("Normalised value (0–1)")
@@ -168,13 +171,13 @@ fig_p = make_subplots(
     subplot_titles=country_names,
     specs=[[{"secondary_y": True}, {"secondary_y": True}], [{"secondary_y": True}, {"secondary_y": True}]],
 )
-date_str_list = [str(d.date()) for d in DATE_OBJS]
 
 for country in country_names:
     r, c = rc_map[country]
     col  = PALETTE[country]
     cases = cases_series[country]
     mob   = mobility_series[country]
+    date_str_list = date_str_by[country]
 
     fig_p.add_trace(go.Scatter(
         x=date_str_list, y=cases.tolist(),
@@ -205,6 +208,7 @@ for country in country_names:
     col  = PALETTE[country]
     c_n  = _minmax(cases_series[country])
     m_n  = _minmax(mobility_series[country])
+    date_str_list = date_str_by[country]
 
     fig_p2.add_trace(go.Scatter(
         x=date_str_list, y=c_n.tolist(),

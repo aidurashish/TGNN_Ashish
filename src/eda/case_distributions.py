@@ -44,6 +44,10 @@ PALETTE = {"England": "#1f77b4", "France": "#ff7f0e", "Italy": "#2ca02c",   "Spa
 def load_labels(folder, label_file):
     path = PROJECT_ROOT / folder / label_file
     df = pd.read_csv(path, index_col=0)
+    if "name" in df.columns:          # Italy has extra 'name' and 'id' columns
+        df = df.set_index("name")
+    date_cols = [c for c in df.columns if str(c).startswith("20")]
+    df = df[date_cols]
     df.columns = pd.to_datetime(df.columns)
     df = df.clip(lower=0)   # treat negatives as 0 for plotting
     return df

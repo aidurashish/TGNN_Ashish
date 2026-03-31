@@ -20,7 +20,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import seaborn as sns
-from datetime import date, timedelta
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -39,37 +38,40 @@ COUNTRIES = {
 }
 
 PALETTE = {"England": "#1f77b4", "France": "#ff7f0e", "Italy": "#2ca02c",   "Spain": "#d62728"}
-N_REGIONS = 30
 
 # Helper functions
-def _expected_dates():
-    dates, d = [], date(2020, 3, 13)
-    while d <= date(2020, 5, 12):
-        dates.append(str(d))
-        d += timedelta(days=1)
-    return dates
-
-DATES = _expected_dates()
-N = len(DATES)
-DATE_OBJS = [pd.Timestamp(d) for d in DATES]
-
-
 def load_labels(folder, label_file):
     path = PROJECT_ROOT / folder / label_file
     df = pd.read_csv(path, index_col=0)
-    return list(df.index)
+    if "name" in df.columns:          # Italy has extra 'name' and 'id' columns
+        df = df.set_index("name")
+    date_cols = [c for c in df.columns if str(c).startswith("20")]
+    return list(df[date_cols].index)
+
+
+def load_label_df(folder, label_file):
+    """Return normalised label DataFrame (index=regions, columns=date strings)."""
+    path = PROJECT_ROOT / folder / label_file
+    df = pd.read_csv(path, index_col=0)
+    if "name" in df.columns:
+        df = df.set_index("name")
+    date_cols = [c for c in df.columns if str(c).startswith("20")]
+    return df[date_cols]
 
 
 def load_graph(folder, prefix, d, regions):
     """
     RETURNS:
-        - W         : (N_REGIONS × N_REGIONS) np.ndarray, cross-region flows only
-        - in_degree : (N_REGIONS,) — number of distinct in-neighbours (cross-region)
-        - in_strength: (N_REGIONS,) — sum of incoming cross-region weights
+        - W          : (n_regions × n_regions) np.ndarray, cross-region flows only
+        - in_degree  : (n_regions,) — number of distinct in-neighbours (cross-region)
+        - in_strength: (n_regions,) — sum of incoming cross-region weights
     """
+    n = len(regions)
     idx = {r: i for i, r in enumerate(regions)}
-    W = np.zeros((N_REGIONS, N_REGIONS))
+    W = np.zeros((n, n))
     p = PROJECT_ROOT / folder / "graphs" / f"{prefix}_{d}.csv"
+    if not p.exists():
+        return W, np.zeros(n), np.zeros(n)
     with open(p, newline="") as f:
         for row in csv.reader(f):
             if len(row) >= 3:
@@ -87,28 +89,34 @@ def load_graph(folder, prefix, d, regions):
 # Compute per-day stats for all countries
 print("Computing graph stats (this may take ~60 s)…")
 
-data = {}   # { country: { "in_strength": (N_REGIONS, N),
-            #               "in_degree":   (N_REGIONS, N),
-            #               "density":     (N,),
+data = {}   # { country: { "in_strength": (n_regions, n_dates),
+            #               "in_degree":   (n_regions, n_dates),
+            #               "density":     (n_dates,),
             #               "regions":     [str],
-            #               "W_repr":      (N_REGIONS, N_REGIONS)  # representative adj
-            # } }
+            #               "W_repr":      (n_regions, n_regions),
+            #               "date_objs":   [Timestamp],
+            #               "n_regions":   int } }
 
 for country, (folder, lf, prefix) in COUNTRIES.items():
     print(f"  {country}…")
-    regions = load_labels(folder, lf)
-    in_str = np.zeros((N_REGIONS, N))
-    in_deg = np.zeros((N_REGIONS, N))
-    densities = np.zeros(N)
-    max_edges = N_REGIONS * (N_REGIONS - 1)
+    regions   = load_labels(folder, lf)
+    n_regions = len(regions)
+    df_lab    = load_label_df(folder, lf)
+    dates     = list(df_lab.columns)          # string dates
+    n         = len(dates)
+    date_objs = [pd.Timestamp(d) for d in dates]
 
-    # Representative date: pick peak-case day and load labels to determine peak
-    df_lab = pd.read_csv(PROJECT_ROOT / folder / lf, index_col=0)
-    national = df_lab.sum(axis=0)
+    in_str    = np.zeros((n_regions, n))
+    in_deg    = np.zeros((n_regions, n))
+    densities = np.zeros(n)
+    max_edges = n_regions * (n_regions - 1)
+
+    # Representative date: peak national case day
+    national  = df_lab.sum(axis=0)
     peak_date = national.idxmax()   # string like '2020-04-01'
 
     W_repr = None
-    for t, d in enumerate(DATES):
+    for t, d in enumerate(dates):
         W, deg, strength = load_graph(folder, prefix, d, regions)
         in_str[:, t] = strength
         in_deg[:, t] = deg
@@ -118,7 +126,7 @@ for country, (folder, lf, prefix) in COUNTRIES.items():
             W_repr = W.copy()
 
     if W_repr is None:
-        W_repr = load_graph(folder, prefix, DATES[N // 2], regions)[0]
+        W_repr = load_graph(folder, prefix, dates[n // 2], regions)[0]
 
     data[country] = {
         "in_strength": in_str,
@@ -127,17 +135,19 @@ for country, (folder, lf, prefix) in COUNTRIES.items():
         "regions":     regions,
         "W_repr":      W_repr,
         "peak_date":   peak_date,
+        "date_objs":   date_objs,
+        "n_regions":   n_regions,
     }
 
     # Save per-day stats CSV
     rows = []
-    for t, d in enumerate(DATES):
+    for t, d in enumerate(dates):
         rows.append({
-            "date":           d,
-            "mean_in_strength": float(in_str[:, t].mean()),
+            "date":               d,
+            "mean_in_strength":   float(in_str[:, t].mean()),
             "median_in_strength": float(np.median(in_str[:, t])),
-            "mean_in_degree":  float(in_deg[:, t].mean()),
-            "graph_density":   float(densities[t]),
+            "mean_in_degree":     float(in_deg[:, t].mean()),
+            "graph_density":      float(densities[t]),
         })
     stats_df = pd.DataFrame(rows)
     csv_path = OUT_DIR / f"graph_stats_{country.lower()}.csv"
@@ -159,11 +169,12 @@ for ax, country in zip(axes, country_names):
     median_s = np.median(in_str, axis=0)
     p25      = np.percentile(in_str, 25, axis=0)
     p75      = np.percentile(in_str, 75, axis=0)
+    date_objs = data[country]["date_objs"]
 
-    ax.fill_between(DATE_OBJS, p25 / 1e3, p75 / 1e3,
+    ax.fill_between(date_objs, p25 / 1e3, p75 / 1e3,
                     color=col, alpha=0.15, label="IQR")
-    ax.plot(DATE_OBJS, mean_s / 1e3,   color=col, linewidth=2.2, label="Mean")
-    ax.plot(DATE_OBJS, median_s / 1e3, color=col, linewidth=1.6,
+    ax.plot(date_objs, mean_s / 1e3,   color=col, linewidth=2.2, label="Mean")
+    ax.plot(date_objs, median_s / 1e3, color=col, linewidth=1.6,
             linestyle="--", alpha=0.75, label="Median")
 
     ax.set_title(country, fontsize=13, fontweight="bold")
@@ -187,11 +198,12 @@ axes = axes.flatten()
 
 for ax, country in zip(axes, country_names):
     col    = PALETTE[country]
-    in_deg = data[country]["in_degree"]   # (30, 61)
+    in_deg = data[country]["in_degree"]
+    n_regions = data[country]["n_regions"]
     # Average degree per region across all days
     avg_deg = in_deg.mean(axis=1)
 
-    ax.bar(range(N_REGIONS), sorted(avg_deg, reverse=True), color=col, edgecolor="white", linewidth=0.5, alpha=0.85)
+    ax.bar(range(n_regions), sorted(avg_deg, reverse=True), color=col, edgecolor="white", linewidth=0.5, alpha=0.85)
     ax.set_title(country, fontsize=13, fontweight="bold")
     ax.set_xlabel("Region rank (sorted by avg degree)")
     ax.set_ylabel("Avg in-degree")
@@ -236,7 +248,7 @@ print("Saved: C_top5_hubs.png")
 # D) Graph density over time
 fig, ax = plt.subplots(figsize=(14, 5))
 for country in country_names:
-    ax.plot(DATE_OBJS, data[country]["density"] * 100,
+    ax.plot(data[country]["date_objs"], data[country]["density"] * 100,
             label=country, linewidth=2, color=PALETTE[country])
 
 ax.set_title("Graph density over time  (cross-region edges / max possible x 100%)", fontsize=13, fontweight="bold")

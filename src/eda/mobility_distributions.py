@@ -17,7 +17,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from datetime import date, timedelta
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -38,19 +37,11 @@ COUNTRIES = {
 PALETTE = {"England": "#1f77b4", "France": "#ff7f0e", "Italy": "#2ca02c",   "Spain": "#d62728"}
 
 # Helper functions
-def _expected_dates():
-    dates, d = [], date(2020, 3, 13)
-    while d <= date(2020, 5, 12):
-        dates.append(str(d))
-        d += timedelta(days=1)
-    return dates
-
-DATES = _expected_dates()
-
-
 def load_graph_edges(folder, prefix, date_str):
-    """Return list of (src, dst, weight) for one graph file."""
+    """Return list of (src, dst, weight) for one graph file, or [] if missing."""
     p = PROJECT_ROOT / folder / "graphs" / f"{prefix}_{date_str}.csv"
+    if not p.exists():
+        return []
     edges = []
     with open(p, newline="") as f:
         for row in csv.reader(f):
@@ -62,14 +53,23 @@ def load_graph_edges(folder, prefix, date_str):
     return edges
 
 
+def _get_dates(folder, label_file):
+    """Return list of date strings (YYYY-MM-DD) from label CSV."""
+    df = pd.read_csv(PROJECT_ROOT / folder / label_file, index_col=0)
+    if "name" in df.columns:
+        df = df.set_index("name")
+    return [c for c in df.columns if str(c).startswith("20")]
+
+
 # Pre-compute per-day mobility stats for all countries
 print("Loading graph files…")
 
-# Stores:  { country: { "cross": [total per day], "self": [total per day], "all_cross_weights": [flat list of all cross weights] } }
+# Stores:  { country: { "cross": array, "self": array, "all_cross": array, "date_objs": list } }
 mob = {}
-for country, (folder, _, prefix) in COUNTRIES.items():
+for country, (folder, lf, prefix) in COUNTRIES.items():
+    dates = _get_dates(folder, lf)
     cross_totals, self_totals, all_cross = [], [], []
-    for d in DATES:
+    for d in dates:
         edges = load_graph_edges(folder, prefix, d)
         self_w  = sum(w for s, t, w in edges if s == t)
         cross_w = sum(w for s, t, w in edges if s != t)
@@ -77,13 +77,12 @@ for country, (folder, _, prefix) in COUNTRIES.items():
         cross_totals.append(cross_w)
         all_cross.extend(w for s, t, w in edges if s != t and w > 0)
     mob[country] = {
-        "cross":      np.array(cross_totals),
-        "self":       np.array(self_totals),
-        "all_cross":  np.array(all_cross),
+        "cross":     np.array(cross_totals),
+        "self":      np.array(self_totals),
+        "all_cross": np.array(all_cross),
+        "date_objs": [pd.Timestamp(d) for d in dates],
     }
     print(f"  {country}: {len(all_cross):,} cross-region edge observations loaded")
-
-date_objs = [pd.Timestamp(d) for d in DATES]
 
 
 # A) Edge weight histogram — log-scale x
@@ -118,9 +117,10 @@ fig, axes = plt.subplots(2, 2, figsize=(16, 10), sharex=False)
 axes = axes.flatten()
 
 for ax, country in zip(axes, list(COUNTRIES.keys())):
-    col = PALETTE[country]
-    cross = mob[country]["cross"]
-    self_ = mob[country]["self"]
+    col    = PALETTE[country]
+    cross  = mob[country]["cross"]
+    self_  = mob[country]["self"]
+    date_objs = mob[country]["date_objs"]
 
     ax.plot(date_objs, cross / 1e6, label="Cross-region", color=col,
             linewidth=2)
@@ -149,7 +149,7 @@ for country in COUNTRIES:
     cross  = mob[country]["cross"]
     total  = mob[country]["cross"] + mob[country]["self"]
     frac   = np.where(total > 0, cross / total, np.nan)
-    ax.plot(date_objs, frac * 100, label=country, linewidth=2, color=PALETTE[country])
+    ax.plot(mob[country]["date_objs"], frac * 100, label=country, linewidth=2, color=PALETTE[country])
 
 ax.set_title("Cross-region flow as % of total mobility (lockdown effect)", fontsize=13, fontweight="bold")
 ax.set_ylabel("Cross-region share (%)")
