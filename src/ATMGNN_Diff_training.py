@@ -152,8 +152,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=300, help='Number of epochs.')
     parser.add_argument('--lr', type=float, default=0.001, help='Starting learning rate.')
-    parser.add_argument('--hidden', type=int, default=128, help='Number of hidden units.')
-    parser.add_argument('--batch-size', type=int, default=16, help='Size of batch.')
+    parser.add_argument('--hidden', type=int, default=64, help='Number of hidden units.')
+    parser.add_argument('--batch-size', type=int, default=32, help='Size of batch.')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate.')
     parser.add_argument('--window', type=int, default=7, help='Size of window for features.')
     parser.add_argument('--graph-window', type=int, default=7, help='Size of window for graphs.')
@@ -164,8 +164,8 @@ if __name__ == '__main__':
     parser.add_argument('--rand-weights', type=bool, default=False, help="True or False. Enable ablation where weights in the adjacency matrix are shuffled.")
     parser.add_argument('--rand-seed', type=int, default=0, help="Specify the random seeds for reproducibility.")
     parser.add_argument('--edge-decay', type=float, default=0.5, help='Exponential time decay for edge weights across the graph window (Set to 0.0 to disable decay).')
-    parser.add_argument('--diffusion-steps', type=int, default=100, help='Number of DDPM denoising steps T.')
-    parser.add_argument('--num-samples', type=int, default=30, help='Number of diffusion samples at inference for uncertainty estimation.')
+    parser.add_argument('--diffusion-steps', type=int, default=50, help='Number of DDPM denoising steps T.')
+    parser.add_argument('--num-samples', type=int, default=10, help='Number of diffusion samples at inference for uncertainty estimation.')
 
     args = parser.parse_args()
 
@@ -185,7 +185,7 @@ if __name__ == '__main__':
     print("  Shifts          : 0 to {}".format(args.ahead - 1))
     print("  Epochs          : {} (early stop after {})".format(args.epochs, args.early_stop))
     print("  Diffusion steps : {}".format(args.diffusion_steps))
-    print("  Inference smpls : {}".format(args.num_samples))
+    print("  Inference samples : {}".format(args.num_samples))
     print("  Rand seed       : {}".format(args.rand_seed))
     print("="*60 + "\n")
 
