@@ -21,7 +21,6 @@ import random
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.amp import autocast, GradScaler
 from math import ceil
 from utils import generate_new_batches, AverageMeter, read_datasets
 from models import ATMGNN_Diff
@@ -55,17 +54,13 @@ def train(adj, features, y, node_weights=None):
     optimizer.zero_grad()
 
     # Diffusion training: epsilon-prediction loss on encoder conditioning.
-    with autocast("cuda"):
-        loss_train = model.compute_diffusion_loss(adj, features, y, node_weights=node_weights)
-
-    scaler.scale(loss_train).backward()
-    scaler.unscale_(optimizer)
+    loss_train = model.compute_diffusion_loss(adj, features, y, node_weights=node_weights)
+    loss_train.backward()
     for p in model.parameters():
         if p.grad is not None:
             torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    scaler.step(optimizer)
-    scaler.update()
+    optimizer.step()
 
     # Return target as size placeholder (output.size(0) is used for AverageMeter).
     output = y
@@ -89,13 +84,12 @@ def test(adj, features, y, node_weights=None):
     """
 
     with torch.no_grad():
-        with autocast("cuda"):
-            output = model(adj, features)   # n_samples=1 -> deterministic fc head
-            if node_weights is not None:
-                w = node_weights.repeat(output.size(0) // node_weights.size(0))
-                loss_test = (w * (output - y) ** 2).mean()
-            else:
-                loss_test = F.mse_loss(output, y)
+        output = model(adj, features)   # n_samples=1 -> deterministic fc head
+        if node_weights is not None:
+            w = node_weights.repeat(output.size(0) // node_weights.size(0))
+            loss_test = (w * (output - y) ** 2).mean()
+        else:
+            loss_test = F.mse_loss(output, y)
     return output, loss_test
 
 
@@ -362,7 +356,6 @@ if __name__ == '__main__':
                         optimizer = optim.Adam(
                             filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
                         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5)
-                        scaler = GradScaler("cuda")
 
                         val_among_epochs   = []
                         train_among_epochs = []
