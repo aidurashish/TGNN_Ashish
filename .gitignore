@@ -9,16 +9,16 @@
 !/src/
 !/data/
 !/figures/
-!/Checkpoints/
-!/Predictions/
+!/checkpoints/
+!/predictions/
 !/results/
 
 # Unignore all contents inside the whitelisted directories
 !/src/**
 !/data/**
 !/figures/**
-!/Checkpoints/**
-!/Predictions/**
+!/checkpoints/**
+!/predictions/**
 !/results/**
 
 # Keep virtual environment ignored

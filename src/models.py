@@ -37,22 +37,24 @@ class MPNN_Encoder(nn.Module):
         self.nfeat = nfeat
 
         # Two graph convolution layers that spread information between neighbouring nodes via message passing.
+        # Each region (node) ends up with a summary vector of length: [nhidden]
         self.conv1 = GCNConv(nfeat, nhidden)
         self.conv2 = GCNConv(nhidden, nhidden)
         
         # Learns how important each connection (edge) between two nodes is based on their features (hence, 2*nfeat) and outputs 1 number.
+        # It utilizes a linear layer with adjustable learned weights.
         self.edge_attn = nn.Linear(2 * nfeat, 1)
         
-        # Batch normalisation (per layer), such that mean = 0 and std = 1.
+        # Batch normalisation (per message-passing layer), such that mean = 0, std = 1 and all values are similarly scaled.
         self.bn1 = nn.BatchNorm1d(nhidden)
         self.bn2 = nn.BatchNorm1d(nhidden)
 
         # Two fully-connected dense layers that compress the concatenated features into the output size (nout).
-        # Done in two consecutive  steps to achieve gradual, non-linear compression.
+        # Done in two consecutive  steps to achieve gradual, non-linear compression, broken up by ReLU.
         self.fc1 = nn.Linear(nfeat+2*nhidden, nhidden ) # compress to size: nhidden
-        self.fc2 = nn.Linear(nhidden, nout) # compress to size: nout
+        self.fc2 = nn.Linear(nhidden, nout) # compress to size: nout (refinement when nhidden = nout)
 
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout)  # to prevent overfitting
         self.relu = nn.ReLU()   # for non-linearity (zeroes out negative values).
 
     def forward(self, adj, x):
@@ -67,10 +69,10 @@ class MPNN_Encoder(nn.Module):
                 torch.Tensor: Encoded node embeddings of shape: [num_nodes, nout].
         """
         # Unpack edge sources, destinations and weights from sparse adjacency tensor (adj)
-        lst = list()   # for collecting feature snapshots at different stages and final concatenation 
-        weight = adj.coalesce().values()    # merge duplicates and extract non-zero edge weights
-        adj = adj.coalesce().indices()  # merge duplicates and extract non-zero connections
-        src, dst = adj[0], adj[1]   # collects source node indices and destination node indices
+        lst = list()   # to collect raw features, output of 'conv1' and output of 'conv2'
+        weight = adj.coalesce().values()    # clean up duplicate entries and extract weights from 'adj'
+        adj = adj.coalesce().indices()      # clean up duplicate entries and extract region connections
+        src, dst = adj[0], adj[1]   # unpack into source and destination regions
         
         # Score each edge: "How much should this connection matter given the features at both ends?", given a score range [0, 1].
         attn = torch.sigmoid(self.edge_attn(torch.cat([x[src], x[dst]], dim=1))).squeeze(-1)
@@ -79,8 +81,8 @@ class MPNN_Encoder(nn.Module):
         weight = weight * attn
         lst.append(x)   # save original raw features as first element
 
-        # First message-passing round where each node gathers weighted info from its neighbours.
-        x = self.relu(self.conv1(x,adj,edge_weight=weight))
+        # First message-passing round where each node gathers weighted info. from its neighbours.
+        x = self.relu(self.conv1(x,adj,edge_weight=weight)) # using 'relu' to eliminate negative values which may be irrelevant or contradictory.
         x = self.bn1(x)
         x = self.dropout(x)
         lst.append(x)
@@ -93,17 +95,16 @@ class MPNN_Encoder(nn.Module):
 
         # Stack raw features and both hidden layers, then compress to output size.
         x = torch.cat(lst, dim=1)   # concatenate all three snapshots horizontally
-        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc1(x))  # compress to size: nhidden
         x = self.dropout(x)
-        x = self.relu(self.fc2(x))
+        x = self.relu(self.fc2(x))  # compress to size: nout (refinement layer)
         return x 
 
 
 # Attention Temporal Multiresolution Graph Neural Network 
 class ATMGNN(nn.Module):
     """
-        Full TGNN model: encodes graphs at multiple coarseness levels, then uses self-attention
-        across time window to produce node prediction.
+        Full TGNN model: encodes graphs at multiple coarseness levels, then uses self-attention across time window to produce node prediction.
     """
 
     def __init__(self, nfeat, nhidden, nout, n_nodes, window, dropout, nhead = 1, num_clusters = [10, 5], use_norm = False):
@@ -126,7 +127,7 @@ class ATMGNN(nn.Module):
         self.n_nodes = n_nodes
         self.nhidden = nhidden
         self.nfeat = nfeat
-        self.nhead = nhead  # more heads = look at time form more perspectives
+        self.nhead = nhead  # more heads = look at time from multiple perspectives
         self.use_norm = use_norm
 
         # Encodes the full-resolution graph (finest coarseness level w/ no cluster-grouping).
@@ -135,14 +136,11 @@ class ATMGNN(nn.Module):
         self.num_clusters = num_clusters
 
         # Defines clustering layer and one encoder per coarseness level.
-        self.middle_linear = nn.ModuleList()
-        self.middle_encoder = nn.ModuleList()
+        self.middle_linear = nn.ModuleList()    # learned linear layer to decide which cluster each region belongs to and average embeddings per cluster
+        self.middle_encoder = nn.ModuleList()   # learns a new embedding for each cluster after the graph (adj) is shrunk.
 
         for size in self.num_clusters:
-            # Maps each node's embeddings to 'size'-dimensional cluster assignments, i.e., decides which group each node belongs to.
             self.middle_linear.append(nn.Linear(nhidden, size))
-            
-            # Learns a new embedding for each cluster after the graph is shrunk.
             self.middle_encoder.append(nn.Linear(nhidden, nhidden))
 
         # With 2 coarsening levels and the bottom (finest) level, we have 3 x 'nhidden' features per node.
@@ -154,7 +152,8 @@ class ATMGNN(nn.Module):
         # Lets each timestep decide how much to pay attention to every other timestep via voting.
         self.self_attention = nn.MultiheadAttention((len(self.num_clusters) + 1) * nhidden, self.nhead, dropout=dropout)
         
-        # Turns window timesteps into a single summary vector per region.
+        # Turns window timesteps into a single summary vector per region, i.e...
+        # [window, n_nodes, (len(self.num_clusters) + 1) * nhidden] -> [n_nodes, (len(self.num_clusters) + 1) * nhidden]
         self.linear_reduction = nn.Linear(self.window, 1)
         
         # Final projection layer with combined temporal summary and raw input features, then prediction.
@@ -177,10 +176,12 @@ class ATMGNN(nn.Module):
             RETURNS:
                 torch.Tensor: Conditioning representation of shape: [batch*n_nodes, cond_dim].
         """
+        # reshape features matrix accordingly: [window × n_nodes, nfeat] -> [batch, window, n_nodes, nfeat] 
+        skip = x.view(-1, self.window, self.n_nodes, self.nfeat)  
         
-        # Save raw input features before processing for end concatenation (skip connection).
-        skip = x.view(-1, self.window, self.n_nodes, self.nfeat)    # reshape accordingly
-        skip = torch.transpose(skip, 1, 2).reshape(-1, self.window, self.nfeat) # reorganizes such that each row = one city across time.
+        # reorganizes such that each row = one city across time.
+        # [batch, window, n_nodes, nfeat] → [n_nodes, window, nfeat] by swapping days and regions axis and then flattening.
+        skip = torch.transpose(skip, 1, 2).reshape(-1, self.window, self.nfeat) 
 
         x = x.view(-1, self.nfeat)  # flattens to MPNN_Encoder expected format
 
@@ -191,17 +192,20 @@ class ATMGNN(nn.Module):
         bottom_latent = self.bottom_encoder(adj, x)
         all_latents.append(bottom_latent)
 
-        # Tracks the cumulative mapping from original nodes to current coarse clusters.
+        # Tracks the cumulative mapping from original nodes to current coarse clusters, i.e., dimensions of the reduced matrix obtained
+        # Acts as a shortcut by pre-computing the combined mapping, so you can always project directly from any coarse level back to the original regions.
         product = None
 
         # Multiresolution construction
-        adj = adj.to_dense()
+        adj = adj.to_dense()   # converts originally sparse 'adj' to dense matrix for PyTorch's matmul() operation
         latent = bottom_latent
 
         for level in range(len(self.num_clusters)):
 
             # Assign each node to exactly one cluster 
             assign = self.middle_linear[level](latent)
+            
+            # Softmax used to eliminate fuzzy assignment of nodes to clusters by picking highest-scoring cluster per node
             assign = F.gumbel_softmax(assign, tau = 1, hard = True, dim = 1)
 
             # Builds the full mapping from original nodes to clusters at this level.
@@ -211,23 +215,26 @@ class ATMGNN(nn.Module):
                 product = torch.matmul(product, assign)
 
             # Averages node features within each cluster to get cluster-level features.
-            x = torch.matmul(assign.transpose(0, 1), latent)
-            x = F.normalize(x, dim = 1)
+            x = torch.matmul(assign.transpose(0, 1), latent) # calculate sum of individual embeddings of regions per cluster 
+            x = F.normalize(x, dim = 1) # clusters with more members will naturally have larger values. Normalization rescales each cluster's vector so its length equals 1
 
-            # Shrinks the adjacency matrix to only describe connections between clusters.
+            # Shrinks and restructures the adjacency matrix to only describe connections between clusters.
             adj = torch.matmul(torch.matmul(assign.transpose(0, 1), adj), assign)
+            
             # Row-wise normalisation: each cluster's outgoing weights sum to 1 as dividing by the global sum would collapse all values near zero for dense graphs.
-            row_sums = adj.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            # Prevents a cluster containing many regions from having large connection weights as a result of gaining more edges during the merge.
+            row_sums = adj.sum(dim=1, keepdim=True).clamp(min=1e-8) # clamp() acts as a safeguard against division by zero, in case no edges exist
             adj = adj / row_sums
 
             # Computes new cluster embeddings using a simple graph convolution on the coarse graph.
+            # NOTE: No ReLU because negative embeddings are useful to discard irrelevant clusters, while still maintaining non-linearity
             latent = torch.tanh(self.middle_encoder[level](torch.matmul(adj, x)))
 
             # Projects cluster embeddings back to original nodes so all levels share the same shape.
             extended_latent = torch.matmul(product, latent)
             all_latents.append(extended_latent)
 
-        # Normalization
+        # L2-Normalization [OPTIONAL]
         if self.use_norm == True:
             for idx in range(len(all_latents)):
                 all_latents[idx] = all_latents[idx] / torch.norm(all_latents[idx], p = 2)
@@ -237,8 +244,8 @@ class ATMGNN(nn.Module):
         x = representation
 
         # Blend the multi-resolution features through two fully-connected layers.
-        x = torch.relu(self.mix_1(x))
-        x = torch.relu(self.mix_2(x))
+        x = torch.relu(self.mix_1(x))   # expand
+        x = torch.relu(self.mix_2(x))   # compress
 
         # Reshape so the time dimension is explicity structured as [window, batch*n_nodes, features].
         x = x.view(-1, self.window, self.n_nodes, x.size(1)) 
@@ -251,7 +258,7 @@ class ATMGNN(nn.Module):
         
         # Compress the entire time window into one vector per node (region).
         x = self.linear_reduction(x)
-        x = x.squeeze()
+        x = x.squeeze() # removes the size-1 day axis
         x = torch.transpose(x, 0, 1)
 
         # Flatten and append the raw input features as a skip connection.

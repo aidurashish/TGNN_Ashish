@@ -13,6 +13,6 @@ pandas
 # Machine learning (ML) modules
 scikit-learn
 
-# Visualisation modules
+# Visualisation/plotting modules
 seaborn
 plotly

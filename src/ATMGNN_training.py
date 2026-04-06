@@ -18,6 +18,7 @@ import random
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.amp import autocast, GradScaler
 from math import ceil
 from utils import generate_new_batches, AverageMeter, read_datasets
 from models import ATMGNN
@@ -48,23 +49,26 @@ def train(adj, features, y, node_weights=None):
 
     optimizer.zero_grad()
 
-    output = model(adj, features)
-    if node_weights is not None:
-        # Tile weights to match batch: output may contain multiple samples * n_nodes.
-        w = node_weights.repeat(output.size(0) // node_weights.size(0))
-        loss_mse = (w * (output - y) ** 2).mean()
-    else:
-        loss_mse = F.mse_loss(output, y)
+    with autocast("cuda"):
+        output = model(adj, features)
+        if node_weights is not None:
+            w = node_weights.repeat(output.size(0) // node_weights.size(0))
+            loss_mse = (w * (output - y) ** 2).mean()
+        else:
+            loss_mse = F.mse_loss(output, y)
 
-    # SEIR consistency penalty (predicted case counts cannot be negative).
-    seir_penalty = F.relu(-output).mean()
-    loss_train = loss_mse + SEIR_LAMBDA * seir_penalty
-    loss_train.backward()
+        # SEIR consistency penalty (predicted case counts cannot be negative).
+        seir_penalty = F.relu(-output).mean()
+        loss_train = loss_mse + SEIR_LAMBDA * seir_penalty
+
+    scaler.scale(loss_train).backward()
+    scaler.unscale_(optimizer)
     for p in model.parameters():
         if p.grad is not None:
             torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    optimizer.step()
+    scaler.step(optimizer)
+    scaler.update()
 
     return output, loss_train
 
@@ -85,16 +89,17 @@ def test(adj, features, y, node_weights=None):
     """
 
     with torch.no_grad():
-        output = model(adj, features)
-        if node_weights is not None:
-            w = node_weights.repeat(output.size(0) // node_weights.size(0))
-            loss_test = (w * (output - y) ** 2).mean()
-        else:
-            loss_test = F.mse_loss(output, y)
+        with autocast("cuda"):
+            output = model(adj, features)
+            if node_weights is not None:
+                w = node_weights.repeat(output.size(0) // node_weights.size(0))
+                loss_test = (w * (output - y) ** 2).mean()
+            else:
+                loss_test = F.mse_loss(output, y)
     return output, loss_test
 
 
-def _plot_loss_curve(train_losses, val_losses, model_name, country, out_dir):
+def _plot_loss_curve(train_losses, val_losses, model_name, country, out_dir, tag=''):
     """
     Saves a train/val loss vs epoch curve for one (model, country) pair.
     Uses the final training run (shift=0, last test_sample — most training data).
@@ -109,13 +114,40 @@ def _plot_loss_curve(train_losses, val_losses, model_name, country, out_dir):
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    path = os.path.join(out_dir, '{}_{}_loss_curve.png'.format(model_name, country))
+    path = os.path.join(out_dir, '{}_{}_loss_curve{}.png'.format(model_name, country, tag))
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print('  [PLOT] Loss curve saved to {}'.format(path))
 
 
-def _plot_predictions_vs_actuals(pred_store, model_name, country, out_dir):
+def _plot_loss_curve_all_shifts(all_loss_histories, model_name, country, out_dir):
+    """Overlays train and val loss curves for every shift on one figure."""
+    if not all_loss_histories:
+        return
+    cmap = plt.cm.tab10
+    fig, (ax_t, ax_v) = plt.subplots(1, 2, figsize=(14, 4))
+    for i, shift in enumerate(sorted(all_loss_histories.keys())):
+        train_l, val_l = all_loss_histories[shift]
+        color  = cmap(i % 10)
+        epochs = range(1, len(train_l) + 1)
+        ax_t.plot(epochs, train_l, label='Shift {}'.format(shift), linewidth=1.2, color=color)
+        ax_v.plot(epochs, val_l,   label='Shift {}'.format(shift), linewidth=1.2, color=color, linestyle='--')
+    ax_t.set_title('Train Loss (all shifts)')
+    ax_v.set_title('Val Loss (all shifts)')
+    for ax in (ax_t, ax_v):
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss (MSE)')
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle('{} \u2014 {} \u2014 Loss Curves (All Shifts)'.format(model_name, country), fontsize=12)
+    fig.tight_layout()
+    path = os.path.join(out_dir, '{}_{}_loss_curve_all_shifts.png'.format(model_name, country))
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print('  [PLOT] All-shifts loss curve saved to {}'.format(path))
+
+
+def _plot_predictions_vs_actuals(pred_store, model_name, country, out_dir, tag=''):
     """Saves a grid of subplots (one per shift) comparing mean predicted vs mean actual daily
     case counts (averaged across all regions) for one (model, country) pair."""
     shifts = sorted(pred_store.keys())
@@ -140,7 +172,7 @@ def _plot_predictions_vs_actuals(pred_store, model_name, country, out_dir):
         axes[j // ncols][j % ncols].set_visible(False)
     fig.suptitle('{} — {} — Predictions vs Actuals'.format(model_name, country), fontsize=12)
     fig.tight_layout()
-    path = os.path.join(out_dir, '{}_{}_predictions_vs_actuals.png'.format(model_name, country))
+    path = os.path.join(out_dir, '{}_{}_predictions_vs_actuals{}.png'.format(model_name, country, tag))
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print('  [PLOT] Predictions vs actuals saved to {}'.format(path))
@@ -179,7 +211,7 @@ if __name__ == '__main__':
     print("="*60)
     print("  Device      : {}".format(device))
     print("  Models      : ATMGNN")
-    print("  Countries   : IT, EN, FR")
+    print("  Countries   : IT, EN, FR, ES")
     print("  Shifts      : 0 to {}".format(args.ahead - 1))
     print("  Epochs      : {} (early stop after {})".format(args.epochs, args.early_stop))
     print("  Rand seed   : {}".format(args.rand_seed))
@@ -190,10 +222,12 @@ if __name__ == '__main__':
     meta_labs, meta_graphs, meta_features, meta_y = read_datasets(args.window, args.rand_weights)
     print("[SETUP] Datasets loaded.\n")
 
-    for country in ["IT", "EN", "FR"]:
+    for country in ["IT", "EN", "FR", "ES"]:
 
         if country == "IT":     # Italy
             idx = 0
+        elif country == "ES":   # Spain
+            idx = 1
         elif country == "EN":   # Great Britain
             idx = 2
         elif country == "FR":   # France
@@ -220,22 +254,21 @@ if __name__ == '__main__':
         node_weights = torch.FloatTensor(inv_weights).to(device)
 
         # Create output directories if they don't exist yet.
-        for _dir in ['../results', '../Checkpoints', '../Predictions', '../figures/training']:
+        for _dir in ['../results', '../checkpoints', '../predictions', '../figures/training']:
             if not os.path.exists(_dir):
                 os.makedirs(_dir)
 
         for args.model in ['ATMGNN']:
             print("\n[MODEL] Starting training: {} on {}".format(args.model, country))
-            _loss_history = None    # (train_losses, val_losses) from shift=0 last test_sample
-            _pred_store = {}        # shift -> (mean_pred_per_day, mean_true_per_day)
+            _pred_store = {}           # shift -> (mean_pred_per_day, mean_true_per_day)
 
             # Predicts 0, 1, ..., 'ahead' - 1 days into the future.
             for shift in list(range(0, args.ahead)):
                 print("\n  [SHIFT {}/{}] Model={} Country={}".format(shift + 1, args.ahead, args.model, country))
 
                 # --- Resume check: skip this shift if all three outputs already exist. ---
-                _pred_path    = "../Predictions/predict_{}_shift{}_{}.csv".format(args.model, shift, country)
-                _truth_path   = "../Predictions/truth_{}_shift{}_{}.csv".format(args.model, shift, country)
+                _pred_path    = "../predictions/predict_{}_shift{}_{}.csv".format(args.model, shift, country)
+                _truth_path   = "../predictions/truth_{}_shift{}_{}.csv".format(args.model, shift, country)
                 _results_path = "../results/results_{}_temporal.csv".format(country)
                 _results_row  = "{}_AGW_MMR_{},{},".format(args.model, args.rand_weights, shift)
                 _results_done = False
@@ -252,6 +285,7 @@ if __name__ == '__main__':
                 y_true = np.empty((n_nodes, 0), dtype=int)  # accumulates ground-truth column by column
                 y_val  = []
                 exp    = 0
+                _loss_history_shift = None
 
                 n_test_days = n_samples - shift - args.start_exp
                 print("    Rolling window: {} test days ({} to {})".format(
@@ -307,6 +341,7 @@ if __name__ == '__main__':
                         optimizer = optim.Adam(
                             filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
                         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5)
+                        scaler = GradScaler("cuda")
 
                         val_among_epochs   = []
                         train_among_epochs = []
@@ -345,7 +380,7 @@ if __name__ == '__main__':
                                     'state_dict': model.state_dict(),
                                     'optimizer' : optimizer.state_dict(),
                                     'edge_decay' : args.edge_decay,
-                                }, '../Checkpoints/model_best_{}_shift{}_{}_RW_{}_seed{}_AG.pth.tar'.format(
+                                }, '../checkpoints/model_best_{}_shift{}_{}_RW_{}_seed{}_AG.pth.tar'.format(
                                     args.model, shift, country, args.rand_weights, args.rand_seed))
 
                             # Restart if training has diverged.
@@ -370,13 +405,13 @@ if __name__ == '__main__':
                             stop = True
                             scheduler.step(val_loss)
 
-                    # Capture loss curves from shift=0 for the loss-curve plot.
-                    if shift == 0 and 'train_among_epochs' in dir() and len(train_among_epochs) > 0:
-                        _loss_history = (list(train_among_epochs), list(val_among_epochs))
+                    # Capture loss curves for this shift's per-shift plot.
+                    if 'train_among_epochs' in dir() and len(train_among_epochs) > 0:
+                        _loss_history_shift = (list(train_among_epochs), list(val_among_epochs))
 
                     # === TESTING ===
 
-                    _ckpt_path = '../Checkpoints/model_best_{}_shift{}_{}_RW_{}_seed{}_AG.pth.tar'.format(
+                    _ckpt_path = '../checkpoints/model_best_{}_shift{}_{}_RW_{}_seed{}_AG.pth.tar'.format(
                         args.model, shift, country, args.rand_weights, args.rand_seed)
                     if not os.path.exists(_ckpt_path):
                         print("\n    [WARN] No checkpoint was saved for test_sample={} "
@@ -440,21 +475,17 @@ if __name__ == '__main__':
                         + ",{:.5f}".format(np.sqrt(mean_squared_error(y_true, y_pred)))
                         + ",{:.5f}".format(r2_score(y_true, y_pred)) + "\n")
 
-                np.savetxt("../Predictions/predict_{}_shift{}_{}.csv".format(args.model, shift, country),
+                np.savetxt("../predictions/predict_{}_shift{}_{}.csv".format(args.model, shift, country),
                         y_pred, fmt="%.5f", delimiter=',')
-                np.savetxt("../Predictions/truth_{}_shift{}_{}.csv".format(args.model, shift, country),
+                np.savetxt("../predictions/truth_{}_shift{}_{}.csv".format(args.model, shift, country),
                         y_true, fmt="%.5f", delimiter=',')
-                print("    Predictions saved to ../Predictions/")
+                print("    Predictions saved to ../predictions/")
 
-            # === POST-TRAINING PLOTS ===
-
-            print("\n[PLOT] Generating training plots for {} on {}...".format(args.model, country))
-            if _loss_history is not None:
-                _plot_loss_curve(_loss_history[0], _loss_history[1], args.model, country,
-                                '../figures/training')
-            else:
-                print('  [PLOT] No loss history captured (all runs may have been skipped).')
-            if _pred_store:
-                _plot_predictions_vs_actuals(_pred_store, args.model, country, '../figures/training')
-            else:
-                print('  [PLOT] No predictions captured for plot.')
+                # Per-shift plots — generated immediately so they survive any interruption.
+                _tag = '_shift{}'.format(shift)
+                if _loss_history_shift is not None:
+                    _plot_loss_curve(_loss_history_shift[0], _loss_history_shift[1],
+                                    args.model, country, '../figures/training', tag=_tag)
+                if shift in _pred_store:
+                    _plot_predictions_vs_actuals({shift: _pred_store[shift]},
+                                                args.model, country, '../figures/training', tag=_tag)
