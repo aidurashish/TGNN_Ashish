@@ -261,17 +261,15 @@ if __name__ == '__main__':
             for shift in list(range(0, args.ahead)):
                 print("\n  [SHIFT {}/{}] Model={} Country={}".format(shift + 1, args.ahead, args.model, country))
 
-                # --- Resume check: skip this shift if all three outputs already exist. ---
-                _pred_path    = "../predictions/predict_{}_shift{}_{}.csv".format(args.model, shift, country)
-                _truth_path   = "../predictions/truth_{}_shift{}_{}.csv".format(args.model, shift, country)
+                # --- Resume check: skip this shift if a results row already exists. ---
                 _results_path = "../results/results_{}_temporal.csv".format(country)
                 _results_row  = "{}_AGW_MMR_{},{},".format(args.model, args.rand_weights, shift)
                 _results_done = False
                 if os.path.exists(_results_path):
                     with open(_results_path) as _f:
                         _results_done = any(line.startswith(_results_row) for line in _f)
-                if os.path.exists(_pred_path) and os.path.exists(_truth_path) and _results_done:
-                    print("    [SKIP] Outputs already exist, skipping.")
+                if _results_done:
+                    print("    [SKIP] Predictions already exists, skipping.")
                     continue
                 # ---------------------------------------------------------------------------
 
