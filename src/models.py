@@ -4,6 +4,7 @@
     Includes class definitions for:
     - The graph message-passing encoder (MPNN_Encoder) which acts as a submodule embedded inside ATMGNN.
     - The full multi-resolution attention model (ATMGNN) that analyses a region's connections at multiple scopes over time.
+    - The hybrid ATMGNN_Diff model where the final prediction is delivered by Diffusion-based components.
 """
 
 # === IMPORTS ===
@@ -518,6 +519,11 @@ class ATMGNN_Diff(ATMGNN):
             diffusion_steps=diffusion_steps, hidden_dim=decoder_hidden
         )
 
+        # Learnable SEIR transition rates (softplus keeps them positive).
+        self.log_beta  = nn.Parameter(torch.tensor(0.0))   # transmission rate
+        self.log_gamma = nn.Parameter(torch.tensor(-1.0))  # recovery rate
+        self._seir_sigma = 1.0 / 5.1                       # fixed COVID-19 incubation rate
+
     def forward(self, adj, x, n_samples=1):
         """
             Inference path: encode the input then sample from the diffusion decoder.
@@ -566,4 +572,27 @@ class ATMGNN_Diff(ATMGNN):
             aux_loss = (w * (direct - y_flat) ** 2).mean()
         else:
             aux_loss = F.mse_loss(direct, y_flat)
-        return diffusion_loss + 0.1 * aux_loss
+
+        # Extract fitted SEIR compartments from the most recent timestep's features.
+        feat_w = self.nfeat - 5                                       # width of case-count window in features
+        x_4d   = x.view(-1, self.window, self.n_nodes, self.nfeat)    # [batch, window, n_nodes, nfeat]
+        x_last = x_4d[:, -1, :, :]                                    # [batch, n_nodes, nfeat]
+
+        S_t      = x_last[:, :, feat_w].detach()                      # susceptible proportion
+        E_t      = x_last[:, :, feat_w + 1].detach()                  # exposed proportion
+        I_t      = x_last[:, :, feat_w + 2].detach()                  # infected proportion
+        cur_log  = x_last[:, :, feat_w - 1].detach()                  # log1p(cases) at current day
+
+        beta  = F.softplus(self.log_beta)
+        gamma = F.softplus(self.log_gamma)
+
+        # SEIR one-step forward
+        dI     = self._seir_sigma * E_t - gamma * I_t + beta * S_t * I_t
+        I_next = (I_t + dI).clamp(min=1e-8)
+        ratio  = I_next / I_t.clamp(min=1e-8)
+
+        # Physics prediction in log1p-case space.
+        physics_pred = (cur_log + torch.log(ratio.clamp(min=1e-8))).reshape(-1)
+        seir_loss    = F.mse_loss(direct, physics_pred)
+
+        return diffusion_loss + 0.1 * aux_loss + 0.05 * seir_loss
