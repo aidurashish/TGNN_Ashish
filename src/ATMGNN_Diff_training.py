@@ -222,10 +222,12 @@ if __name__ == '__main__':
     meta_labs, meta_graphs, meta_features, meta_y = read_datasets(args.window, args.rand_weights)
     print("[SETUP] Datasets loaded.\n")
 
-    for country in ["IT", "EN", "FR"]:
+    for country in ["IT", "EN", "FR", "ES"]:
 
         if country == "IT":     # Italy
             idx = 0
+        elif country == "ES":   # Spain
+            idx = 1
         elif country == "EN":   # Great Britain
             idx = 2
         elif country == "FR":   # France
