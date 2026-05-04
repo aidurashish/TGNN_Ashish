@@ -12,6 +12,7 @@ pandas
 
 # Machine learning (ML) modules
 scikit-learn
+optuna
 
 # Visualisation/plotting modules
 seaborn

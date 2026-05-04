@@ -208,7 +208,7 @@ if __name__ == '__main__':
     print("="*60)
     print("  Device             : {}".format(device))
     print("  Models             : ATMGNN_Diff")
-    print("  Countries          : IT, EN, FR")
+    print("  Countries          : IT, EN, FR, ES")
     print("  Shifts             : 0 to {}".format(args.ahead - 1))
     print("  Epochs             : {} (early stop after {})".format(args.epochs, args.early_stop))
     print("  Diffusion steps    : {}".format(args.diffusion_steps))
