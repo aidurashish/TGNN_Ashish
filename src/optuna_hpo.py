@@ -94,7 +94,7 @@ def objective(trial, model_name, dataset, device, hpo_epochs):
         Calls trial.report() after every epoch so MedianPruner can kill bad trials early.
     """
     lr      = trial.suggest_float("lr",      1e-4, 1e-2, log=True)
-    hidden  = trial.suggest_categorical("hidden",  [32, 64, 128])
+    hidden  = trial.suggest_categorical("hidden",  [32, 64, 128, 256])
     dropout = trial.suggest_float("dropout", 0.2,  0.6)
 
     meta_labs, meta_graphs, meta_features, meta_y = dataset
