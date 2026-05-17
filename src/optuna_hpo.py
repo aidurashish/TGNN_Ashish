@@ -161,10 +161,12 @@ def objective(trial, model_name, dataset, device, hpo_epochs):
                 _src_state = torch.load(_ckpt_path, map_location=device,
                                         weights_only=False)['state_dict']
                 _dst_state = model.state_dict()
-                # Copy all ATMGNN keys that exist in the Diff model (skip diffusion decoder).
+                # Copy all ATMGNN keys that exist in the Diff model with matching shapes
                 _dst_state.update({
                     k: v for k, v in _src_state.items()
-                    if k in _dst_state and not k.startswith('diffusion.')
+                    if k in _dst_state
+                    and not k.startswith('diffusion.')
+                    and v.shape == _dst_state[k].shape
                 })
                 model.load_state_dict(_dst_state)
 
