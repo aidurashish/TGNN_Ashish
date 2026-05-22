@@ -1,6 +1,6 @@
 """
-Optuna hyperparameter optimisation for ATMGNN and ATMGNN_Diff for three hyperparameters (lr, hidden, dropout).
-All completed trials are persisted to a SQLite database.
+    Optuna hyperparameter optimisation for ATMGNN and ATMGNN_Diff for three hyperparameters (lr, hidden, dropout).
+    All completed trials are persisted to a SQLite database.
 """
 
 # === IMPORTS ===
