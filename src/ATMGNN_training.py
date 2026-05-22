@@ -94,15 +94,17 @@ def test(adj, features, y, node_weights=None):
     return output, loss_test
 
 
-def _plot_loss_curve(train_losses, val_losses, model_name, country, out_dir, tag=''):
+def _plot_loss_curve(train_losses, val_losses, model_name, country, out_dir, tag='', test_losses=None):
     """
-    Saves a train/val loss vs epoch curve for one (model, country) pair.
+    Saves a train/val/test loss vs epoch curve for one (model, country) pair.
     Uses the final training run (shift=0, last test_sample — most training data).
     """
     fig, ax = plt.subplots(figsize=(8, 4))
     epochs = range(1, len(train_losses) + 1)
     ax.plot(epochs, train_losses, label='Train loss', linewidth=1.5)
     ax.plot(epochs, val_losses,   label='Val loss',   linewidth=1.5, linestyle='--')
+    if test_losses is not None:
+        ax.plot(epochs, test_losses, label='Test loss', linewidth=1.5, linestyle=':')
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Loss (MSE)')
     ax.set_title('{} — {} — Loss / Epoch'.format(model_name, country))
@@ -122,7 +124,8 @@ def _plot_loss_curve_all_shifts(all_loss_histories, model_name, country, out_dir
     cmap = plt.cm.tab10
     fig, (ax_t, ax_v) = plt.subplots(1, 2, figsize=(14, 4))
     for i, shift in enumerate(sorted(all_loss_histories.keys())):
-        train_l, val_l = all_loss_histories[shift]
+        history = all_loss_histories[shift]
+        train_l, val_l = history[0], history[1]
         color  = cmap(i % 10)
         epochs = range(1, len(train_l) + 1)
         ax_t.plot(epochs, train_l, label='Shift {}'.format(shift), linewidth=1.2, color=color)
@@ -337,6 +340,7 @@ if __name__ == '__main__':
 
                         val_among_epochs   = []
                         train_among_epochs = []
+                        test_among_epochs  = []
                         stop               = False
 
                         for epoch in range(args.epochs):
@@ -354,6 +358,10 @@ if __name__ == '__main__':
                             output, val_loss = test(
                                 adj_val[0], features_val[0], y_val[0], node_weights=node_weights)
                             val_loss = float(val_loss.detach().cpu().numpy())
+
+                            _, test_loss_ep = test(adj_test[0], features_test[0], y_test[0], node_weights=node_weights)
+                            test_loss_ep = float(test_loss_ep.cpu().numpy())
+                            test_among_epochs.append(test_loss_ep)
 
                             if epoch % 50 == 0:
                                 print("\n      Epoch {:03d}/{:d}  train_loss={:.5f}  "
@@ -399,7 +407,7 @@ if __name__ == '__main__':
 
                     # Capture loss curves for this shift's per-shift plot.
                     if 'train_among_epochs' in dir() and len(train_among_epochs) > 0:
-                        _loss_history_shift = (list(train_among_epochs), list(val_among_epochs))
+                        _loss_history_shift = (list(train_among_epochs), list(val_among_epochs), list(test_among_epochs))
 
                     # === TESTING ===
 
@@ -476,8 +484,10 @@ if __name__ == '__main__':
                 # Per-shift plots — generated immediately so they survive any interruption.
                 _tag = '_shift{}'.format(shift)
                 if _loss_history_shift is not None:
+                    _tl = _loss_history_shift[2] if len(_loss_history_shift) > 2 else None
                     _plot_loss_curve(_loss_history_shift[0], _loss_history_shift[1],
-                                    args.model, country, '../figures/training', tag=_tag)
+                                    args.model, country, '../figures/training', tag=_tag,
+                                    test_losses=_tl)
                 if shift in _pred_store:
                     _plot_predictions_vs_actuals({shift: _pred_store[shift]},
                                                 args.model, country, '../figures/training', tag=_tag)
