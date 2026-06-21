@@ -306,6 +306,20 @@ if __name__ == "__main__":
             row     = {"country": country, "shift": shift}
             row.update(metrics)
 
+            # Load quantile regression bounds (if produced by the retrained model).
+            q_low_path  = PRED_DIR / "q_low_{}_shift{}_{}.csv".format(MODEL, shift, country)
+            q_high_path = PRED_DIR / "q_high_{}_shift{}_{}.csv".format(MODEL, shift, country)
+            y_q_low  = _load_csv(q_low_path)
+            y_q_high = _load_csv(q_high_path)
+            if (y_q_low is not None and y_q_high is not None
+                    and y_q_low.shape == y_pred.shape == y_q_high.shape):
+                covered_q = (y_true >= y_q_low) & (y_true <= y_q_high)
+                row["PICP_quantile"]  = float(covered_q.mean())
+                row["quantile_CRPS"] = _interval_score(y_q_low, y_q_high, y_true, alpha=0.80)
+            else:
+                row["PICP_quantile"]  = float("nan")
+                row["quantile_CRPS"] = float("nan")
+
             # Load baseline ATMGNN predictions for accuracy comparison.
             base_pred_path = PRED_DIR / "predict_ATMGNN_shift{}_{}.csv".format(shift, country)
             base_true_path = PRED_DIR / "truth_ATMGNN_shift{}_{}.csv".format(shift, country)

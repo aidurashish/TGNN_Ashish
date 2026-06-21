@@ -286,6 +286,8 @@ if __name__ == '__main__':
                 y_pred  = np.empty((n_nodes, 0), dtype=int)   # accumulates predictions column by column
                 y_true  = np.empty((n_nodes, 0), dtype=int)   # accumulates ground-truth column by column
                 y_uncert = np.empty((n_nodes, 0), dtype=float) # per-node uncertainty estimates
+                y_q_low  = np.empty((n_nodes, 0), dtype=float)  # quantile lower bound (10th pct)
+                y_q_high = np.empty((n_nodes, 0), dtype=float)  # quantile upper bound (90th pct)
                 y_val   = []
                 exp     = 0
                 _loss_history_shift = None
@@ -486,6 +488,14 @@ if __name__ == '__main__':
                                     - np.expm1(np.clip(o_log - u_log, 0.0, 10.0))) / 2.0
                         y_uncert = np.append(y_uncert, u_cases.reshape(-1, 1), axis=1)
 
+                    # Quantile regression bounds (asymmetric interval in original case-count space).
+                    with torch.no_grad():
+                        q_low_log, q_high_log = model.predict_bounds(adj_test[0], features_test[0])
+                    y_q_low  = np.append(y_q_low,
+                        np.expm1(np.clip(q_low_log.cpu().numpy(),  0.0, 10.0)).reshape(-1, 1), axis=1)
+                    y_q_high = np.append(y_q_high,
+                        np.expm1(np.clip(q_high_log.cpu().numpy(), 0.0, 10.0)).reshape(-1, 1), axis=1)
+
                     del adj_train, features_train, y_train
                     del adj_val, features_val, y_val
                     del adj_test, features_test, y_test
@@ -526,6 +536,11 @@ if __name__ == '__main__':
                 if y_uncert.shape[1] > 0:
                     np.savetxt("../predictions/uncertainty_{}_shift{}_{}.csv".format(
                         args.model, shift, country), y_uncert, fmt="%.5f", delimiter=',')
+                if y_q_low.shape[1] > 0:
+                    np.savetxt("../predictions/q_low_{}_shift{}_{}.csv".format(
+                        args.model, shift, country), y_q_low,  fmt="%.5f", delimiter=',')
+                    np.savetxt("../predictions/q_high_{}_shift{}_{}.csv".format(
+                        args.model, shift, country), y_q_high, fmt="%.5f", delimiter=',')
                 print("    Predictions saved to ../predictions/")
 
                 # Per-shift plots
