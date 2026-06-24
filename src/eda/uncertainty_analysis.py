@@ -142,6 +142,17 @@ def _compute_metrics(y_pred, y_true, y_uncert):
     metrics["PICP_2sigma_cal"] = float(((y_true >= lower_2s_cal) & (y_true <= upper_2s_cal)).mean())
     metrics["mean_CRPS_cal"]   = _interval_score(lower_1s_cal, upper_1s_cal, y_true, alpha=0.32)
 
+    # Post-hoc asymmetric quantile-regression calibration.
+    residuals = (y_true - y_pred).ravel()
+    q_low_offset  = float(np.percentile(residuals, 10))  # negative => lower bound below pred
+    q_high_offset = float(np.percentile(residuals, 90))  # positive => upper bound above pred
+    lower_q = y_pred + q_low_offset
+    upper_q = y_pred + q_high_offset
+    metrics["q_low_offset"]  = q_low_offset
+    metrics["q_high_offset"] = q_high_offset
+    metrics["PICP_quantile"] = float(((y_true >= lower_q) & (y_true <= upper_q)).mean())
+    metrics["quantile_CRPS"] = _interval_score(lower_q, upper_q, y_true, alpha=0.80)
+
     return metrics
 
 
@@ -305,20 +316,6 @@ if __name__ == "__main__":
             metrics = _compute_metrics(y_pred, y_true, y_uncert)
             row     = {"country": country, "shift": shift}
             row.update(metrics)
-
-            # Load quantile regression bounds (if produced by the retrained model).
-            q_low_path  = PRED_DIR / "q_low_{}_shift{}_{}.csv".format(MODEL, shift, country)
-            q_high_path = PRED_DIR / "q_high_{}_shift{}_{}.csv".format(MODEL, shift, country)
-            y_q_low  = _load_csv(q_low_path)
-            y_q_high = _load_csv(q_high_path)
-            if (y_q_low is not None and y_q_high is not None
-                    and y_q_low.shape == y_pred.shape == y_q_high.shape):
-                covered_q = (y_true >= y_q_low) & (y_true <= y_q_high)
-                row["PICP_quantile"]  = float(covered_q.mean())
-                row["quantile_CRPS"] = _interval_score(y_q_low, y_q_high, y_true, alpha=0.80)
-            else:
-                row["PICP_quantile"]  = float("nan")
-                row["quantile_CRPS"] = float("nan")
 
             # Load baseline ATMGNN predictions for accuracy comparison.
             base_pred_path = PRED_DIR / "predict_ATMGNN_shift{}_{}.csv".format(shift, country)

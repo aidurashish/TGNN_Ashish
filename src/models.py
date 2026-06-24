@@ -524,16 +524,6 @@ class ATMGNN_Diff(ATMGNN):
         self.log_gamma = nn.Parameter(torch.tensor(-1.0))  # recovery rate
         self._seir_sigma = 1.0 / 5.1                       # fixed COVID-19 incubation rate
 
-        # Quantile regression heads for asymmetric prediction intervals.
-        self.fc_q_low  = nn.Linear(cond_dim, nout)  #10th-percentile lower bound
-        self.fc_q_high = nn.Linear(cond_dim, nout)  #90th-percentile upper bound 
-
-    @staticmethod
-    def _quantile_loss(pred, target, q):
-        """Pinball (tilted-L1) loss, where q=0.10 => lower bound and q=0.90 => upper bound."""
-        error = target - pred
-        return torch.mean(torch.max(q * error, (q - 1) * error))
-
     def forward(self, adj, x, n_samples=1):
         """
             Inference path: encode the input then sample from the diffusion decoder.
@@ -555,23 +545,6 @@ class ATMGNN_Diff(ATMGNN):
         # Diffusion sampling for uncertainty quantification (n_samples > 1).
         samples = self.diffusion.sample(cond, n_samples=n_samples)
         return samples.squeeze(-1)
-
-    def predict_bounds(self, adj, x):
-        """
-            Returns the asymmetric quantile regression interval bounds in log1p-case space.
-            
-            ARGS:
-                adj          (torch.sparse_coo_tensor): Batch adjacency matrix.
-                x            (torch.Tensor): Batch node features.    
-
-            RETURNS:
-                q_low  (torch.Tensor): 10th-percentile lower bound, shape [batch*n_nodes].
-                q_high (torch.Tensor): 90th-percentile upper bound, shape [batch*n_nodes].
-        """
-        cond   = self.encode(adj, x)
-        q_low  = self.relu(self.fc_q_low(cond)).squeeze(-1).view(-1)
-        q_high = self.relu(self.fc_q_high(cond)).squeeze(-1).view(-1)
-        return q_low, q_high
 
     def compute_diffusion_loss(self, adj, x, y_target, node_weights=None):
         """
@@ -600,12 +573,6 @@ class ATMGNN_Diff(ATMGNN):
         else:
             aux_loss = F.mse_loss(direct, y_flat)
 
-        # Quantile regression loss: teach fc_q_low/fc_q_high the 10th/90th percentile bounds.
-        q_low_pred  = self.relu(self.fc_q_low(cond)).squeeze(-1).view(-1)
-        q_high_pred = self.relu(self.fc_q_high(cond)).squeeze(-1).view(-1)
-        quantile_loss = (self._quantile_loss(q_low_pred, y_flat, 0.10)
-                        + self._quantile_loss(q_high_pred, y_flat, 0.90))
-
         # Extract fitted SEIR compartments from the most recent timestep's features.
         feat_w = self.nfeat - 5                                       # width of case-count window in features
         x_4d   = x.view(-1, self.window, self.n_nodes, self.nfeat)    # [batch, window, n_nodes, nfeat]
@@ -628,4 +595,4 @@ class ATMGNN_Diff(ATMGNN):
         physics_pred = (cur_log + torch.log(ratio.clamp(min=1e-8))).reshape(-1)
         seir_loss    = F.mse_loss(direct, physics_pred)
 
-        return diffusion_loss + 0.1 * aux_loss + 0.05 * seir_loss + 0.05 * quantile_loss
+        return diffusion_loss + 0.1 * aux_loss + 0.05 * seir_loss
