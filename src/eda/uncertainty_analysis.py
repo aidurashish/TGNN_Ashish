@@ -168,12 +168,15 @@ def _plot_calibration(summary_df, country, out_dir):
     x      = np.arange(len(shifts))
     width  = 0.25
 
+    has_quantile = "PICP_quantile" in df.columns
+
     fig, ax = plt.subplots(figsize=(max(6, len(shifts) * 1.5), 4))
 
-    ax.bar(x - width * 1.5, df["PICP_1sigma"].values,     width, label="Raw ±1σ",        color="steelblue",   alpha=0.6)
-    ax.bar(x - width * 0.5, df["PICP_1sigma_cal"].values,  width, label="Calibrated ±1σ", color="steelblue")
-    ax.bar(x + width * 0.5, df["PICP_2sigma"].values,     width, label="Raw ±2σ",        color="tomato",     alpha=0.6)
-    ax.bar(x + width * 1.5, df["PICP_2sigma_cal"].values,  width, label="Calibrated ±2σ", color="tomato")
+    ax.bar(x - width, df["PICP_1sigma"].values, width, label="Raw ±1σ",   color="steelblue", alpha=0.6)
+    ax.bar(x,         df["PICP_2sigma"].values, width, label="Raw ±2σ",   color="tomato",    alpha=0.6)
+    if has_quantile:
+        ax.bar(x + width, df["PICP_quantile"].values, width, label="Quantile calibrated (target 80%)", color="seagreen")
+        ax.axhline(0.80, color="seagreen", linestyle="--", linewidth=1.2, label="Target 80%")
     ax.axhline(0.68, color="steelblue", linestyle="--", linewidth=1.2, label="Target 68%")
     ax.axhline(0.95, color="tomato",    linestyle="--", linewidth=1.2, label="Target 95%")
 
@@ -226,15 +229,18 @@ def _plot_crps_comparison(summary_df, out_dir):
     n          = len(countries)
     fig, axes  = plt.subplots(1, n, figsize=(4 * n, 4), squeeze=False)
 
+    has_quantile = "quantile_CRPS" in summary_df.columns
+
     for i, country in enumerate(countries):
         ax  = axes[0][i]
         df  = summary_df[summary_df["country"] == country]
         shifts = sorted(df["shift"].unique())
         x      = np.arange(len(shifts))
         w      = 0.25
-        ax.bar(x - w,       df["mean_CRPS"].values,     w, label="Diffusion (raw)",        color="steelblue", alpha=0.6)
-        ax.bar(x,           df["mean_CRPS_cal"].values, w, label="Diffusion (calibrated)", color="steelblue")
-        ax.bar(x + w,       df["baseline_CRPS"].values, w, label="Naive rolling-std",      color="lightcoral")
+        ax.bar(x - w,   df["mean_CRPS"].values,     w, label="Diffusion (raw)",        color="steelblue", alpha=0.6)
+        if has_quantile:
+            ax.bar(x,   df["quantile_CRPS"].values, w, label="Diffusion (calibrated)", color="seagreen")
+        ax.bar(x + w,   df["baseline_CRPS"].values, w, label="Naive rolling-std",      color="lightcoral")
         ax.set_xticks(x)
         ax.set_xticklabels(["S+{}".format(s) for s in shifts], fontsize=8)
         ax.set_title(country)
