@@ -508,7 +508,7 @@ def _country_worker(packed_args):
 
 # ARIMA (CPU-only, run sequentially)
 
-def _run_arima_all_countries(meta_labs, meta_graphs):
+def _run_arima_all_countries(meta_labs, meta_graphs, full_results):
     """Runs ARIMA for all countries"""
     results = {}
     for country in COUNTRIES:
@@ -518,6 +518,11 @@ def _run_arima_all_countries(meta_labs, meta_graphs):
         n_regions = labels.shape[0]
         print("\n  [ARIMA][{}]  ({} regions, {} test days)".format(
             country, n_regions, n_samples - START_EXP), flush=True)
+
+        if _is_done(full_results, "ARIMA", country):
+            print("    [SKIP] Already complete.", flush=True)
+            results[country] = {s: full_results[("ARIMA", country, s)] for s in range(AHEAD)}
+            continue
 
         # Accumulators indexed by shift.
         preds  = {s: [] for s in range(AHEAD)}   # flat predicted values
@@ -612,6 +617,53 @@ def _load_saved_predictions(model_prefix):
 
 # === OUTPUT ===
 
+_FULL_CSV    = os.path.join(OUT_DIR, "results_ablation_full.csv")
+_CSV_HEADER  = "model,country,shift,mean_result,std_result,MAE,MSE,RMSE,R2\n"
+
+
+def _load_checkpoint_csv():
+    existing_full = {}
+    existing_all  = {}
+    if not os.path.exists(_FULL_CSV):
+        return existing_full, existing_all
+    with open(_FULL_CSV, 'r') as f:
+        f.readline()   # skip header
+        for line in f:
+            parts = line.strip().split(',')
+            if len(parts) < 9:
+                continue
+            model, country, shift = parts[0], parts[1], int(parts[2])
+            m = {
+                'mean_result': float(parts[3]), 'std_result': float(parts[4]),
+                'MAE':  float(parts[5]), 'MSE':  float(parts[6]),
+                'RMSE': float(parts[7]), 'R2':   float(parts[8]),
+            }
+            existing_full[(model, country, shift)] = m
+            existing_all.setdefault(model, {}).setdefault(country, {})[shift] = m
+    n = len(existing_full)
+    if n > 0:
+        print("[RESUME] Loaded {} previously computed rows.".format(n), flush=True)
+    return existing_full, existing_all
+
+
+def _is_done(full_results, model_name, country):
+    """Returns True if all AHEAD shifts for (model, country) are already in full_results."""
+    return all((model_name, country, s) in full_results for s in range(AHEAD))
+
+
+def _append_to_csv(model_name, country, shift_metrics):
+    """Appends one completed (model, country) block to the full CSV immediately."""
+    write_header = not os.path.exists(_FULL_CSV)
+    with open(_FULL_CSV, 'a') as f:
+        if write_header:
+            f.write(_CSV_HEADER)
+        for shift, m in shift_metrics.items():
+            f.write("{},{},{},{:.5f},{:.5f},{:.5f},{:.5f},{:.5f},{:.5f}\n".format(
+                model_name, country, shift,
+                m['mean_result'], m['std_result'],
+                m['MAE'], m['MSE'], m['RMSE'], m['R2']))
+
+
 def _print_table(summary):
     header = "{:<35} {:>10} {:>10} {:>10} {:>10}".format("Model", "MAE", "MSE", "RMSE", "R2")
     print("\n" + "=" * 80)
@@ -636,16 +688,8 @@ def _save_results(summary, full_results):
                 name, m['mean_result'], m['std_result'],
                 m['MAE'], m['MSE'], m['RMSE'], m['R2']))
 
-    # Full CSV - one row per (model, country, shift), matching main results file format.
-    with open(os.path.join(OUT_DIR, "results_ablation_full.csv"), "w") as f:
-        f.write("model,country,shift,mean_result,std_result,MAE,MSE,RMSE,R2\n")
-        for (name, country, shift), m in full_results.items():
-            f.write("{},{},{},{:.5f},{:.5f},{:.5f},{:.5f},{:.5f},{:.5f}\n".format(
-                name, country, shift,
-                m['mean_result'], m['std_result'],
-                m['MAE'], m['MSE'], m['RMSE'], m['R2']))
-
-    print("[SAVE] Results written to {}/".format(OUT_DIR))
+    # Full CSV is written incrementally via _append_to_csv — do not overwrite here.
+    print("[SAVE] Summary written to {}/".format(OUT_DIR))
 
 
 # === MAIN ===
@@ -692,14 +736,14 @@ if __name__ == '__main__':
             BATCH_SIZE, EDGE_DECAY, RAND_SEED, SEIR_LAMBDA,
             DIFFUSION_STEPS, DECODER_HIDDEN, CKPT_DIR)
 
-    all_results  = {}
-    full_results = {}
+    # Load any results saved before the last interruption.
+    full_results, all_results = _load_checkpoint_csv()
 
-    # Model 1: ARIMA (CPU, sequential)                                    
+    # Model 1: ARIMA (CPU, sequential)
     print("\n" + "-" * 70)
     print("  MODEL: ARIMA")
     print("-" * 70)
-    all_results["ARIMA"] = _run_arima_all_countries(meta_labs, meta_graphs)
+    all_results["ARIMA"] = _run_arima_all_countries(meta_labs, meta_graphs, full_results)
     for country, sm in all_results["ARIMA"].items():
         for shift, m in sm.items():
             full_results[("ARIMA", country, shift)] = m
@@ -712,13 +756,19 @@ if __name__ == '__main__':
         print("  MODEL: {}".format(model_name))
         print("-" * 70)
 
-        all_results[model_name] = {}
+        all_results.setdefault(model_name, {})
         for country in COUNTRIES:
+            if _is_done(full_results, model_name, country):
+                print("  [SKIP] {} {} already complete.".format(model_name, country), flush=True)
+                all_results[model_name][country] = {
+                    s: full_results[(model_name, country, s)] for s in range(AHEAD)}
+                continue
             packed_args = (model_name, country) + country_data[country] + _cfg
             shift_metrics = _country_worker(packed_args)
             all_results[model_name][country] = shift_metrics
             for shift, m in shift_metrics.items():
                 full_results[(model_name, country, shift)] = m
+            _append_to_csv(model_name, country, shift_metrics)
 
     # Models 6 & 7: Load existing predictions (no retraining)               
     for model_name, prefix in [("ATMGNN_withSEIR",     "ATMGNN"),
@@ -726,10 +776,22 @@ if __name__ == '__main__':
         print("\n" + "-" * 70)
         print("  MODEL: {} (loading from predictions/)".format(model_name))
         print("-" * 70)
-        all_results[model_name] = _load_saved_predictions(prefix)
-        for country, sm in all_results[model_name].items():
-            for shift, m in sm.items():
-                full_results[(model_name, country, shift)] = m
+        all_results.setdefault(model_name, {})
+        if not _is_done(full_results, model_name, list(COUNTRIES)[-1]):
+            loaded = _load_saved_predictions(prefix)
+            for country, sm in loaded.items():
+                all_results[model_name][country] = sm
+                if not _is_done(full_results, model_name, country):
+                    for shift, m in sm.items():
+                        full_results[(model_name, country, shift)] = m
+                    _append_to_csv(model_name, country, sm)
+                else:
+                    for shift, m in sm.items():
+                        full_results.setdefault((model_name, country, shift), m)
+        else:
+            for country in COUNTRIES:
+                all_results[model_name][country] = {
+                    s: full_results[(model_name, country, s)] for s in range(AHEAD)}
 
     # Aggregate and report                                                 
     ORDERED = [
