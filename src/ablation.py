@@ -22,7 +22,6 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.multiprocessing as mp
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from statsmodels.tsa.arima.model import ARIMA as ARIMAModel
 from torch_geometric.nn.conv import GCNConv
@@ -55,7 +54,6 @@ DIFFUSION_STEPS = 50
 DECODER_HIDDEN  = 128     
 COUNTRIES       = ["IT", "EN", "FR", "ES"]
 COUNTRY_IDX     = {"IT": 0, "ES": 1, "EN": 2, "FR": 3}
-MAX_WORKERS     = 4
 
 # Hyperparameters for BiLSTM and STAN (no HPO was run for these baselines).
 LR              = 0.001
@@ -256,8 +254,6 @@ def _country_worker(packed_args):
     _active_hidden  = _GNN_HIDDEN  if _use_gnn_hp else _HIDDEN
     _active_dropout = _GNN_DROPOUT if _use_gnn_hp else _DROPOUT
 
-    os.makedirs(_CKPT_DIR, exist_ok=True)
-
     # Helpers local to this worker
 
     def _make_model():
@@ -390,14 +386,12 @@ def _country_worker(packed_args):
 
             n_batches = ceil((len(idx_train) * (2 if _augment else 1)) / _BATCH_SIZE)
 
-            # Training with restart logic (matches both main scripts)
-            _ckpt_path    = os.path.join(
-                _CKPT_DIR,
-                "ablation_{}_shift{}_{}.pth.tar".format(model_name, shift, country))
-            best_val_acc  = float('inf')
-            max_restarts  = 3
-            restart_count = 0
-            stop          = False
+            # Training with restart logic 
+            best_val_acc   = float('inf')
+            best_state_dict = None   
+            max_restarts   = 3
+            restart_count  = 0
+            stop           = False
 
             while not stop:
                 restart_count += 1
@@ -412,9 +406,8 @@ def _country_worker(packed_args):
                     filter(lambda p: p.requires_grad, model.parameters()), lr=_active_lr)
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5)
 
-                val_history   = []
-                train_history = []
-                stop          = False
+                val_history = []
+                stop        = False
 
                 for epoch in range(_EPOCHS):
                     model.train()
@@ -427,7 +420,6 @@ def _country_worker(packed_args):
                     model.eval()
                     vl, _ = _val_loss(model, adj_val[0], feat_val[0], y_val[0])
 
-                    train_history.append(train_loss_meter.avg)
                     val_history.append(vl)
 
                     if not np.isfinite(vl) or vl > 1e12:
@@ -436,10 +428,9 @@ def _country_worker(packed_args):
                         break
 
                     if vl < best_val_acc:
-                        best_val_acc = vl
-                        torch.save({'state_dict': model.state_dict(),
-                                    'optimizer':  optimizer.state_dict()},
-                                _ckpt_path)
+                        best_val_acc    = vl
+                        best_state_dict = {k: v.cpu().clone()
+                                           for k, v in model.state_dict().items()}
 
                     # Early stop: stalled in first 30 epochs (matches main scripts)
                     if 10 < epoch < 30:
@@ -455,8 +446,8 @@ def _country_worker(packed_args):
                     stop = True
                     scheduler.step(vl)
 
-            # Testing 
-            if not os.path.exists(_ckpt_path):
+            # Testing
+            if best_state_dict is None:
                 del adj_train, feat_train, y_train
                 del adj_val,   feat_val,   y_val
                 del adj_test,  feat_test,  y_test
@@ -464,8 +455,8 @@ def _country_worker(packed_args):
                     torch.cuda.empty_cache()
                 continue
 
-            ckpt = torch.load(_ckpt_path, weights_only=False)
-            model.load_state_dict(ckpt['state_dict'])
+            model.load_state_dict({k: v.to(device) for k, v in best_state_dict.items()})
+            best_state_dict = None   # free RAM immediately after restore
             model.eval()
 
             output = _test_output(model, adj_test[0], feat_test[0])
@@ -518,50 +509,67 @@ def _country_worker(packed_args):
 # ARIMA (CPU-only, run sequentially)
 
 def _run_arima_all_countries(meta_labs, meta_graphs):
-    """
-    Runs ARIMA for all countries. Kept sequential since ARIMA is CPU-only
-    and very fast. Operates in original case-count scale.
-    """
+    """Runs ARIMA for all countries"""
     results = {}
     for country in COUNTRIES:
         idx       = COUNTRY_IDX[country]
         labels    = meta_labs[idx]
         n_samples = len(meta_graphs[idx])
         n_regions = labels.shape[0]
-        print("\n  [ARIMA][{}]".format(country), flush=True)
+        print("\n  [ARIMA][{}]  ({} regions, {} test days)".format(
+            country, n_regions, n_samples - START_EXP), flush=True)
+
+        # Accumulators indexed by shift.
+        preds  = {s: [] for s in range(AHEAD)}   # flat predicted values
+        truths = {s: [] for s in range(AHEAD)}   # flat ground-truth values
+        daily  = {s: [] for s in range(AHEAD)}   # per-test-day mean abs error
+
+        for test_sample in range(START_EXP, n_samples):
+            day_preds = {s: [] for s in range(AHEAD)}
+            day_truth = {s: [] for s in range(AHEAD)}
+
+            for j in range(n_regions):
+                series = labels.iloc[j, :test_sample].values.astype(float)
+
+                if series.sum() == 0:
+                    yhats = [0.0] * AHEAD
+                else:
+                    try:
+                        fit   = ARIMAModel(series, order=(2, 0, 2)).fit()
+                        yhats = [float(abs(v)) for v in fit.forecast(steps=AHEAD)]
+                    except Exception:
+                        try:
+                            fit   = ARIMAModel(series, order=(1, 0, 0)).fit()
+                            yhats = [float(abs(v)) for v in fit.forecast(steps=AHEAD)]
+                        except Exception:
+                            yhats = [float(np.mean(series[-WINDOW:]))] * AHEAD
+
+                for s in range(AHEAD):
+                    target_idx = test_sample + s
+                    if target_idx >= n_samples:
+                        continue
+                    target = float(labels.iloc[j, target_idx])
+                    day_preds[s].append(max(yhats[s], 0.0))
+                    day_truth[s].append(max(target,   0.0))
+
+            for s in range(AHEAD):
+                if day_preds[s]:
+                    preds[s].extend(day_preds[s])
+                    truths[s].extend(day_truth[s])
+                    daily[s].append(float(np.mean(
+                        abs(np.array(day_preds[s]) - np.array(day_truth[s])))))
+
+            if (test_sample - START_EXP + 1) % 10 == 0:
+                print("    test_sample {}/{}".format(
+                    test_sample - START_EXP + 1, n_samples - START_EXP), flush=True)
 
         shift_metrics = {}
-        for shift in range(AHEAD):
-            y_pred_all, y_true_all = [], []
-            result = []   # per-test-day MAE
-            for test_sample in range(START_EXP, n_samples - shift):
-                day_pred, day_true = [], []
-                for j in range(n_regions):
-                    series = labels.iloc[j, :test_sample].values.astype(float)
-                    target = float(labels.iloc[j, test_sample + shift])
-                    if series.sum() == 0:
-                        yhat = 0.0
-                    else:
-                        try:
-                            fit  = ARIMAModel(series, order=(2, 0, 2)).fit()
-                            yhat = float(abs(fit.forecast(steps=shift + 1)[-1]))
-                        except Exception:
-                            try:
-                                fit  = ARIMAModel(series, order=(1, 0, 0)).fit()
-                                yhat = float(abs(fit.forecast(steps=shift + 1)[-1]))
-                            except Exception:
-                                yhat = float(np.mean(series[-WINDOW:]))
-                    day_pred.append(max(yhat, 0.0))
-                    day_true.append(max(target, 0.0))
-                y_pred_all.extend(day_pred)
-                y_true_all.extend(day_true)
-                result.append(float(np.mean(abs(np.array(day_pred) - np.array(day_true)))))
-
-            shift_metrics[shift] = _compute_metrics(
-                np.array(y_pred_all), np.array(y_true_all), result=result)
+        for s in range(AHEAD):
+            shift_metrics[s] = _compute_metrics(
+                np.array(preds[s]), np.array(truths[s]), result=daily[s])
             print("    Shift {} -> MAE={:.4f} MSE={:.4f} RMSE={:.4f} R2={:.4f}".format(
-                shift, shift_metrics[shift]['MAE'], shift_metrics[shift]['MSE'],
-                shift_metrics[shift]['RMSE'], shift_metrics[shift]['R2']), flush=True)
+                s, shift_metrics[s]['MAE'], shift_metrics[s]['MSE'],
+                shift_metrics[s]['RMSE'], shift_metrics[s]['R2']), flush=True)
 
         results[country] = shift_metrics
     return results
@@ -643,15 +651,13 @@ def _save_results(summary, full_results):
 # === MAIN ===
 
 if __name__ == '__main__':
-    mp.set_start_method('spawn', force=True)
 
     import random
     torch.manual_seed(RAND_SEED)
     random.seed(RAND_SEED)
     np.random.seed(RAND_SEED)
 
-    os.makedirs(OUT_DIR,  exist_ok=True)
-    os.makedirs(CKPT_DIR, exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
 
     print("\n" + "=" * 70)
     print("  ABLATION STUDY")
@@ -661,7 +667,6 @@ if __name__ == '__main__':
     print("  Countries   : {}".format(", ".join(COUNTRIES)))
     print("  Shifts      : 0 to {}".format(AHEAD - 1))
     print("  Epochs      : {} (early stop after {})".format(EPOCHS, EARLY_STOP))
-    print("  Workers     : {} (parallel countries)".format(MAX_WORKERS))
     print("=" * 70 + "\n")
 
     print("[SETUP] Loading datasets...")
@@ -699,7 +704,7 @@ if __name__ == '__main__':
         for shift, m in sm.items():
             full_results[("ARIMA", country, shift)] = m
 
-    # Models 2 - 5: GNN-based models (parallel across countries)            
+    # Models 2-5: GNN-based models (sequential)
     GNN_MODELS = ["BiLSTM", "STAN", "ATMGNN_noSEIR", "DiffATMGNN_noSEIR"]
 
     for model_name in GNN_MODELS:
@@ -707,16 +712,10 @@ if __name__ == '__main__':
         print("  MODEL: {}".format(model_name))
         print("-" * 70)
 
-        worker_args = [
-            (model_name, country) + country_data[country] + _cfg
-            for country in COUNTRIES
-        ]
-
-        with mp.Pool(processes=min(MAX_WORKERS, len(COUNTRIES))) as pool:
-            country_results = pool.map(_country_worker, worker_args)
-
         all_results[model_name] = {}
-        for country, shift_metrics in zip(COUNTRIES, country_results):
+        for country in COUNTRIES:
+            packed_args = (model_name, country) + country_data[country] + _cfg
+            shift_metrics = _country_worker(packed_args)
             all_results[model_name][country] = shift_metrics
             for shift, m in shift_metrics.items():
                 full_results[(model_name, country, shift)] = m
