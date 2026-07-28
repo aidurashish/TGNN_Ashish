@@ -4,7 +4,7 @@
     Includes class definitions for:
     - The graph message-passing encoder (MPNN_Encoder) which acts as a submodule embedded inside ATMGNN.
     - The full multi-resolution attention model (ATMGNN) that analyses a region's connections at multiple scopes over time.
-    - The hybrid ATMGNN_Diff model where the final prediction is delivered by Diffusion-based components.
+    - The hybrid DiffATMGNN model where the final prediction is delivered by Diffusion-based components.
 """
 
 # === IMPORTS ===

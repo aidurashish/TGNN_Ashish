@@ -1,5 +1,5 @@
 """
-    Core functions for loading, preprocessing, and batching data used to train the model.
+    Core functions for loading, preprocessing, and batching data used to train the DiffATMGNN model.
 """
 
 # === IMPORTS === 
