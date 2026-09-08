@@ -81,7 +81,7 @@ def test(adj, features, y, node_weights=None):
     """
 
     with torch.no_grad():
-        output = model(adj, features)   # n_samples=1 -> deterministic fc head
+        output = model(adj, features)   # n_samples=1 -> mean of sampled diffusion forecasts
         if node_weights is not None:
             w = node_weights.repeat(output.size(0) // node_weights.size(0))
             loss_test = (w * (output - y) ** 2).mean()
