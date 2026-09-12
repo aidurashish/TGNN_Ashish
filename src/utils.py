@@ -4,15 +4,15 @@
 
 # === IMPORTS === 
 
-import torch
-import networkx as nx
-import numpy as np
-import scipy.sparse as sp
-import pandas as pd
-from datetime import date, timedelta
-import os
-from scipy.integrate import odeint
-from scipy.optimize import minimize
+import torch    # ore deep-learning framework
+import networkx as nx   # Create and analyse graphs and networks
+import numpy as np  # Numerical operations
+import scipy.sparse as sp   # For storing large sparse matrices
+import pandas as pd # Read and process CSV files
+from datetime import date, timedelta    # Handle calendar dates and time differences
+import os   # Handle files and directories
+from scipy.integrate import odeint  # For solving ordinary differential equations (for SEIR)
+from scipy.optimize import minimize # To find parameter values that minimize the SEIR mathematical objective function.
 
 # === FUNCTIONS === 
 
@@ -23,7 +23,6 @@ COVID_SIGMA = 1.0 / 5.1 # Value obtained from study published in Annals of Inter
 def _seir_odes(compartments, t, beta, sigma, gamma):
     """
         Defines the SEIR ODE system, where the population is split into four compartments.
-        All values are kept proportional, i.e., N=1, such that parameters are independent of scale.
 
         ARGS:
             compartments (list): Current [S, E, I, R] state values.
@@ -36,7 +35,7 @@ def _seir_odes(compartments, t, beta, sigma, gamma):
             list: Derivatives [dS/dt, dE/dt, dI/dt, dR/dt].
     """
     S, E, I, R = compartments
-    N = S + E + I + R   # conserved quantity, i.e., equals 1.0
+    N = S + E + I + R   # equals 1.0
     dS = -beta * S * I / N
     dE =  beta * S * I / N - sigma * E
     dI =  sigma * E - gamma * I
@@ -46,7 +45,7 @@ def _seir_odes(compartments, t, beta, sigma, gamma):
 
 def _fit_seir_to_region(case_counts):
     """
-        Fits SEIR ODE parameters to a single region's observed case curve using
+        Fits an SEIR model to a single region's observed case curve using
         Nelder-Mead optimisation, then returns the smoothed compartment trajectory.
 
         ARGS:
@@ -55,28 +54,30 @@ def _fit_seir_to_region(case_counts):
         RETURNS:
             np.ndarray: Fitted trajectory of shape: [n_days, 4], columns = [S, E, I, R], expressed as proportions of the inferred total population (N=1).
     """
-    case_arr = np.array(case_counts, dtype=float).clip(min=0)
-    n = len(case_arr)
+    case_arr = np.array(case_counts, dtype=float).clip(min=0)   # Convert input case array to float values for consistency and turn negative case counts to zero (if any).
+    n = len(case_arr)   # Number of days in observation period
 
     # Normalisation
-    total = max(case_arr.sum(), 1.0)
+    total = max(case_arr.sum(), 1.0)    # Total observed cases
     i_obs = (case_arr / total).clip(0, 1)
 
-    # Seed initial compartment fractions from the first observed data point.
-    I0  = float(i_obs[0])
-    E0  = min(I0 * 2.0, 1.0)   # Exposed (E) pool is roughly twice infected early in an outbreak
-    R0  = 0.0
-    S0  = max(1.0 - I0 - E0 - R0, 0.0)
-    y0  = [S0, E0, I0, R0]
+    # Set initial compartment fractions from the first observed data point.
+    I0  = float(i_obs[0])   # First normalzied case value
+    E0  = min(I0 * 2.0, 1.0)   # Exposed (E) pool is roughly twice the infected pool early in an outbreak
+    R0  = 0.0   # Because nobody recovers early in the pandemic
+    S0  = max(1.0 - I0 - E0 - R0, 0.0)  # Assign remaining population to Susceptible pool
+    y0  = [S0, E0, I0, R0]  # Initial SEIR state
 
-    t_span = np.arange(n, dtype=float)
+    t_span = np.arange(n, dtype=float)  # Creates one time value per observation.
 
+    # Residual (error) function to be minimized by the optimizer
     def _residuals(params):
-        beta, gamma = params
-        if beta <= 0 or gamma <= 0:
-            return 1e6
+        beta, gamma = params    # Transmission and Recovery rates
+        if beta <= 0 or gamma <= 0: # Reject invalid negative or zero rates
+            return 1e6  # A very large value to tell the optimizer that the value is unacceptable
         try:
-            sol = odeint(_seir_odes, y0, t_span, args=(beta, COVID_SIGMA, gamma))
+            # Compare simulated curve with observed curve
+            sol = odeint(_seir_odes, y0, t_span, args=(beta, COVID_SIGMA, gamma))   # Shape: [n_days, 4_states]
             return float(np.mean((sol[:, 2] - i_obs) ** 2))
         except Exception:
             return 1e6
@@ -84,77 +85,107 @@ def _fit_seir_to_region(case_counts):
     # Optimise starting from typical COVID-19 parameter estimates.
     result = minimize(
         _residuals,
-        x0=[0.3, 0.1],
+        x0=[0.3, 0.1],  # Begin with beta = 0.3 and gamma = 0.1
         method='Nelder-Mead',
         options={'xatol': 1e-4, 'fatol': 1e-4, 'maxiter': 2000},
     )
+    # OPTIONS: 
+    # (1) xatol => Stop when parameter changes are extremely small like 1e-4 
+    # (2) fatol => Stop when error changes are extremely small like 1e-4
+    # (3) maxiter => Allow 2000 iterations at the most
 
+    # Extract optimized parameters
+    # max() ensures values are slightly positive
     beta_fit  = max(result.x[0], 1e-6)
     gamma_fit = max(result.x[1], 1e-6)
 
+    # Run SEIR one last time with optimized/fitted parameters
     trajectory = odeint(_seir_odes, y0, t_span, args=(beta_fit, COVID_SIGMA, gamma_fit))
-    # Clip to [0, 1] to guard against minor ODE solver overshoot.
-    return np.clip(trajectory, 0.0, 1.0)
+    return np.clip(trajectory, 0.0, 1.0)    # Force output to range [0,1]
 
 
 def _backfill_late_starters(labels):
-    """For regions whose first nonzero report arrives after day 0, backfill the silent leading period using an exponential decay estimated from the regions that were already reporting during the same window."""
-    fixed = labels.copy().astype(float)
+    """
+        For regions whose first nonzero report arrives after day 0, 
+        this function backfills the silent leading period using an exponential decay estimated from the regions that were already reporting during the same window.
+    """
+    fixed = labels.copy().astype(float) # Copy and convert input values to float (prevent changes to original dataset)
     vals  = fixed.values.copy()
 
     # Mean daily log-growth rate of regions that reported from day 0.
-    early_rates = []
+    early_rates = []    # Collect rates of early-reporting regions 
+    # Per-region loop
     for row in vals:
-        nz = np.where(row > 0)[0]
+        nz = np.where(row > 0)[0]   # Find the positions of positive (non-zero) case values.
+        
+        # Find consecutive non-zero positive case reports from day 0 
         if len(nz) > 0 and nz[0] == 0 and nz[-1] > 0:
-            log_seg = np.log1p(row[:nz[-1] + 1])
+            log_seg = np.log1p(row[:nz[-1] + 1])    # Take logarithm [log(1+x)] of reporting period
+            # NOTE: We take log1p because log(0) is unidentified
             if len(log_seg) > 1:
                 early_rates.append(np.mean(np.diff(log_seg)))
+                
+    # If no suitable early-reporting regions exist, return the data unchanged.
     if not early_rates:
-        return fixed  # nothing to do
-    mean_growth = np.mean(early_rates)
+        return fixed  
+    mean_growth = np.mean(early_rates) # Estimates the average daily log-growth rate.
 
+    # Process each late-starting region
     for i, region in enumerate(fixed.index):
         row = vals[i].copy()
         nz  = np.where(row > 0)[0]
+        
+        # Skip regions without late-start
         if len(nz) == 0 or nz[0] == 0:
             continue  # already starts from day 0
-        first_nz = nz[0]
-        # Backfill day first_nz-1 down to 0 using inverse exponential growth.
+        first_nz = nz[0]    # Store first reporting day of late-starting region
+        
+        # Backfilling: move backward from the day before the first positive report to day 0.
         for day in range(first_nz - 1, -1, -1):
             row[day] = max(1.0, np.round(row[day + 1] * np.exp(-mean_growth)))
         fixed.iloc[i] = row
 
-    return fixed
+    return fixed    # Return corrected dataset
 
 
 def _interpolate_reporting_gaps(labels):
-    """Linearly interpolate interior zero values in each region's time series."""
-    fixed = labels.copy().astype(float)
+    """
+        Linearly interpolates interior zero values in each region's time series.
+    """
+    fixed = labels.copy().astype(float) # Create a copy and convert to float values 
+    
+    # Per-region loop 
     for region in fixed.index:
-        row = fixed.loc[region].values.copy()
-        nonzero_idx = np.where(row > 0)[0]
+        row = fixed.loc[region].values.copy()   # Get region's case values
+        nonzero_idx = np.where(row > 0)[0]  # Find days with positive (non-zero) reports
+        
+        # Skip regions with fewer than two positive values, as interpolation needs a starting and ending known value.
         if len(nonzero_idx) < 2:
             continue
-        first_nz, last_nz = nonzero_idx[0], nonzero_idx[-1]
-        x = np.arange(len(row))
-        interior_zeros = (row == 0) & (x > first_nz) & (x < last_nz)
+        
+        first_nz, last_nz = nonzero_idx[0], nonzero_idx[-1] # Finds the first and last positive-reporting days.
+        x = np.arange(len(row)) # Create array of day positions
+        interior_zeros = (row == 0) & (x > first_nz) & (x < last_nz)    # Select zeros between the first and last positive values.. 
         if not interior_zeros.any():
             continue
-        row_interp = np.interp(x, x[row > 0], row[row > 0])
-        row[interior_zeros] = np.round(row_interp[interior_zeros])
-        fixed.loc[region] = np.maximum(row, 0)
-    return fixed
+        row_interp = np.interp(x, x[row > 0], row[row > 0]) # Estimates values between known positive points using straight lines by one-dimensional linear interpolation
+        row[interior_zeros] = np.round(row_interp[interior_zeros])  # Rounds the estimated values to whole case counts.
+        fixed.loc[region] = np.maximum(row, 0)  # Ensure no value is negative
+    return fixed    # Return corrected dataset
 
 
 def _smooth_batch_reporting(labels, window=3):
-    """Apply a rolling median filter to smooth batch-reporting spikes."""
-    fixed = labels.copy().astype(float)
+    """
+        Applies a rolling median filter to smooth batch-reporting spikes.
+    """
+    fixed = labels.copy().astype(float) # Create a copy and convert to float values 
+    
+    # Per-region loop
     for region in fixed.index:
-        row = pd.Series(fixed.loc[region].values.copy())
-        smoothed = row.rolling(window, center=True, min_periods=1).median()
-        fixed.loc[region] = np.maximum(np.round(smoothed.values), 0)
-    return fixed
+        row = pd.Series(fixed.loc[region].values.copy())    # Create a pandas time series out of region's values
+        smoothed = row.rolling(window, center=True, min_periods=1).median() # Aply rolling-median
+        fixed.loc[region] = np.maximum(np.round(smoothed.values), 0)    # Prevent negative values and round up values
+    return fixed    # Return corrected dataset
 
 
 def read_datasets(window, rand_weight=False):
@@ -255,7 +286,7 @@ def read_datasets(window, rand_weight=False):
 
     final_targets.append(y)
 
-    # Great Britain
+    # England
     os.chdir("../England [COVID-19]")
     labels = pd.read_csv("england_labels.csv")
     labels = labels.set_index("name")
@@ -349,13 +380,13 @@ def generate_graphs(dates, country, rand_weight=False):
         d = pd.read_csv("graphs/" + country + "_" + date + ".csv",header=None)
         G = nx.DiGraph()
         
-        # Gather every unique region that appears as a source or destination.
+        # Gather every *unique* region that appears as a source or destination.
         nodes = set(d[0].unique()).union(set(d[1].unique()))
         nodes = sorted(nodes)
         G.add_nodes_from(nodes)
 
         if rand_weight:
-            # Ignore actual travel flows and connect every pair of regions with weight 1.
+            # Ignores actual travel flows and connect every pair of regions with weight 1 [FOR ABLATION ONLY]
             for node_start in list(G.nodes):
                 for node_end in list(G.nodes):
                     G.add_edge(node_start, node_end, weight=1)
@@ -534,7 +565,9 @@ def sparse_matrix_to_torch_sparse_tensor(sparse_mx):
 # === CLASS DEFINITION === 
 
 class AverageMeter(object):
-    """Running tracker that keeps a rolling average of a metric across batches."""
+    """
+        Running tracker that keeps a rolling average of a metric across batches.
+    """
 
     def __init__(self):
         self.reset()

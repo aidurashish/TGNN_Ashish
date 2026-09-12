@@ -10,56 +10,55 @@
 
 # === IMPORTS ===
 
-import os
-import time
-import argparse
-import numpy as np
-import random
-import torch
-import torch.nn.functional as F
-import torch.optim as optim
-from math import ceil
-from utils import generate_new_batches, AverageMeter, read_datasets
-from models import ATMGNN_Diff
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import matplotlib
-matplotlib.use('Agg')   # non-interactive backend; safe for scripts with no display
-import matplotlib.pyplot as plt
+import os   # Used to save outputs and plots to the correct directories 
+import time # Record how long one epoch takes
+import argparse # To read custom arguments passed onto training script when running
+import numpy as np  # For calculating mean of plausible set of predictions produced
+import random   # Randomly shuffle countries for training or choose a seed     
+import torch    # Core deep-learning framework
+import torch.nn.functional as F # NN functions such as ReLu, Softmax, Dropout that have no memory
+import torch.optim as optim # Adam optimiser 
+from math import ceil   # For calculating batch counts
+from utils import generate_new_batches, AverageMeter, read_datasets     # Data pre-processing 
+from models import ATMGNN_Diff  # Main model to be trained and tested
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score   # Metrics
+import matplotlib   # Configures plotting of charts
+matplotlib.use('Agg')   # Selects a non-window plotting mode that lets the script save graphs as image files on a server or terminal with no screen.
+import matplotlib.pyplot as plt # Commands to make/plot charts
 
 # === FUNCTIONS ===
 
-# Weight controlling the relative importance of the SEIR biological consistency penalty
-# applied to the auxiliary direct-head loss during diffusion training.
-SEIR_LAMBDA = 0.1
+# Constant to control how much the SEIR penalty matters compared to the main diffusion loss during training.
+SEIR_LAMBDA = 0.1   # nudges the model towards biological realism, but does not dominate.
 
 def train(adj, features, y, node_weights=None):
     """
-    Runs one forward pass (diffusion denoising loss) and backward pass and updates
-    the model weights.
+    Runs a forward pass (diffusion denoising loss), then a backward pass and updates the model weights.
 
     ARGS:
         adj          (torch.sparse_coo_tensor): Batch adjacency matrix.
         features     (torch.FloatTensor): Batch node feature matrix.
         y            (torch.FloatTensor): Ground-truth target values for this batch.
-        node_weights (torch.FloatTensor | None): Per-node loss weights for scale balancing.
+        node_weights (torch.FloatTensor | None): Per-node loss weights for scale balancing [OPTINAL].
 
     RETURNS:
-        output     (torch.Tensor): Ground-truth y (size placeholder; predictions come from the fc head at test time).
+        output     (torch.Tensor): Ground-truth y (size placeholder; predictions at test time).
         loss_train (torch.Tensor): Diffusion training loss scalar.
     """
 
-    optimizer.zero_grad()
+    optimizer.zero_grad()   # Wipe out leftover gradients from any previous step.
 
     # Diffusion training: epsilon-prediction loss on encoder conditioning.
     loss_train = model.compute_diffusion_loss(adj, features, y, node_weights=node_weights)
-    loss_train.backward()
+    loss_train.backward()   # Backpropagataion: "Which weights caused the error?"
     for p in model.parameters():
         if p.grad is not None:
-            torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    optimizer.step()
+            torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)  # Clean up any broken gradient values like infinity or NaN. Prevents the model from malfunctioning.
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)    # If any gradient is too large, shrink it down to 1.0 max
+    optimizer.step()    # Update the model weights using the refined gradients.
 
-    # Return target as size placeholder (output.size(0) is used for AverageMeter).
+    # NOTE: 'output' here is not a prediction. The model's actual prediction happens inside compute_diffusion_loss() and is never surfaced. 
+    # Instead y (ground-truth) is returned for AverageMeter to determine how many samples the loss was computed over.
     output = y
     return output, loss_train
 
@@ -80,9 +79,10 @@ def test(adj, features, y, node_weights=None):
         loss_test (torch.Tensor): MSE loss scalar.
     """
 
-    with torch.no_grad():
-        output = model(adj, features)   # n_samples=1 -> mean of sampled diffusion forecasts
-        if node_weights is not None:
+    with torch.no_grad():   # Tells PyTorch not to track any gradients, as we are measuring, not learning.
+        output = model(adj, features)   # Get model prediction
+        # Compute the MSE loss between prediction and truth.
+        if node_weights is not None:    # If node weights exist, larger regions are penalised less
             w = node_weights.repeat(output.size(0) // node_weights.size(0))
             loss_test = (w * (output - y) ** 2).mean()
         else:
@@ -92,10 +92,12 @@ def test(adj, features, y, node_weights=None):
 
 def _plot_loss_curve(train_losses, val_losses, model_name, country, out_dir, tag='', test_losses=None):
     """
-    Saves a train/val/test loss vs epoch curve for one (model, country) pair.
-    Uses the final training run (shift=0, last test_sample — most training data).
+        Saves a train/val/test loss vs epoch curve for one (model, country) pair.
+        Uses the final training run (shift=0, last test_sample — most training data).
     """
-    fig, ax = plt.subplots(figsize=(8, 4))
+    
+    # Create and plot on canvas
+    fig, ax = plt.subplots(figsize=(8, 4))  
     epochs = range(1, len(train_losses) + 1)
     ax.plot(epochs, train_losses, label='Train loss', linewidth=1.5)
     ax.plot(epochs, val_losses,   label='Val loss',   linewidth=1.5, linestyle='--')
@@ -108,47 +110,25 @@ def _plot_loss_curve(train_losses, val_losses, model_name, country, out_dir, tag
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     path = os.path.join(out_dir, '{}_{}_loss_curve{}.png'.format(model_name, country, tag))
+    
+    # Save the plot to disk and free memory.
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print('  [PLOT] Loss curve saved to {}'.format(path))
 
-
-def _plot_loss_curve_all_shifts(all_loss_histories, model_name, country, out_dir):
-    """Overlays train and val loss curves for every shift on one figure."""
-    if not all_loss_histories:
-        return
-    cmap = plt.cm.tab10
-    fig, (ax_t, ax_v) = plt.subplots(1, 2, figsize=(14, 4))
-    for i, shift in enumerate(sorted(all_loss_histories.keys())):
-        history = all_loss_histories[shift]
-        train_l, val_l = history[0], history[1]
-        color  = cmap(i % 10)
-        epochs = range(1, len(train_l) + 1)
-        ax_t.plot(epochs, train_l, label='Shift {}'.format(shift), linewidth=1.2, color=color)
-        ax_v.plot(epochs, val_l,   label='Shift {}'.format(shift), linewidth=1.2, color=color, linestyle='--')
-    ax_t.set_title('Train Loss (all shifts)')
-    ax_v.set_title('Val Loss (all shifts)')
-    for ax in (ax_t, ax_v):
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Loss')
-        ax.legend(fontsize=7)
-        ax.grid(True, alpha=0.3)
-    fig.suptitle('{} \u2014 {} \u2014 Loss Curves (All Shifts)'.format(model_name, country), fontsize=12)
-    fig.tight_layout()
-    path = os.path.join(out_dir, '{}_{}_loss_curve_all_shifts.png'.format(model_name, country))
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print('  [PLOT] All-shifts loss curve saved to {}'.format(path))
-
-
 def _plot_predictions_vs_actuals(pred_store, model_name, country, out_dir, tag=''):
-    """Saves a grid of subplots (one per shift) comparing mean predicted vs mean actual daily
-    case counts (averaged across all regions) for one (model, country) pair."""
+    """
+        Saves a grid of subplots (one per shift) comparing mean predicted vs mean actual daily
+        case counts (averaged across all regions) for one (model, country) pair.
+    """
+    
     shifts = sorted(pred_store.keys())
     if not shifts:
         return
+    # Find out how many rows and columns the grid needs (Max. 4 columns per row)
     ncols = min(len(shifts), 4)
     nrows = (len(shifts) + ncols - 1) // ncols
+    
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.5 * nrows), squeeze=False)
     for i, shift in enumerate(shifts):
         ax = axes[i // ncols][i % ncols]
@@ -162,12 +142,14 @@ def _plot_predictions_vs_actuals(pred_store, model_name, country, out_dir, tag='
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
         
-    # Hide any unused subplot panels
+    # Hide any unused/blank subplot panels
     for j in range(len(shifts), nrows * ncols):
         axes[j // ncols][j % ncols].set_visible(False)
     fig.suptitle('{} — {} — Predictions vs Actuals'.format(model_name, country), fontsize=12)
     fig.tight_layout()
     path = os.path.join(out_dir, '{}_{}_predictions_vs_actuals{}.png'.format(model_name, country, tag))
+    
+    # Save the plot to disk and free memory.
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print('  [PLOT] Predictions vs actuals saved to {}'.format(path))
@@ -177,37 +159,38 @@ def _plot_predictions_vs_actuals(pred_store, model_name, country, out_dir, tag='
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=300, help='Number of epochs.')
-    parser.add_argument('--lr', type=float, default=0.001, help='Starting learning rate.')
+    parser.add_argument('--epochs', type=int, default=300, help='Number of epochs.')    # a.k.a, training rounds 
+    parser.add_argument('--lr', type=float, default=0.001, help='Starting learning rate.')  # How big of weight updates to make
     parser.add_argument('--hidden', type=int, default=64, help='Number of hidden units.')
-    parser.add_argument('--batch-size', type=int, default=32, help='Size of batch.')
-    parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate.')
+    parser.add_argument('--batch-size', type=int, default=32, help='Size of batch.')    # Number of days sampled at once
+    parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate.') # Percentage of neurons to randomly switch off to prevent overfitting
     parser.add_argument('--window', type=int, default=7, help='Size of window for features.')
-    parser.add_argument('--graph-window', type=int, default=7, help='Size of window for graphs.')
-    parser.add_argument('--early-stop', type=int, default=100, help='How many epochs to wait before stopping.')
+    parser.add_argument('--graph-window', type=int, default=7, help='Size of window for graphs.')   # No. of past days to pass as input features
+    parser.add_argument('--early-stop', type=int, default=100, help='How many epochs to wait before stopping.') # Stop at these many epochs if validation loss does not improve
     parser.add_argument('--start-exp', type=int, default=15, help='The first day to start the predictions.')
     parser.add_argument('--ahead', type=int, default=7, help='The number of days ahead of the train set the predictions should reach.')
     parser.add_argument('--sep', type=int, default=10, help='Seperator for validation and train set.')
     parser.add_argument('--rand-weights', type=bool, default=False, help="True or False. Enable ablation where weights in the adjacency matrix are shuffled.")
     parser.add_argument('--rand-seed', type=int, default=0, help="Specify the random seeds for reproducibility.")
-    parser.add_argument('--edge-decay', type=float, default=0.5, help='Exponential time decay for edge weights across the graph window (Set to 0.0 to disable decay).')
+    parser.add_argument('--edge-decay', type=float, default=0.5, help='Exponential time decay for edge weights across the graph window (Set to 0.0 to disable decay).') # Older graphs contribute less
     parser.add_argument('--diffusion-steps', type=int, default=50, help='Number of DDPM denoising steps T.')
-    parser.add_argument('--num-samples', type=int, default=10, help='Number of diffusion samples at inference for uncertainty estimation.')
+    parser.add_argument('--num-samples', type=int, default=10, help='Number of diffusion samples at inference.')
 
     args = parser.parse_args()
 
-    # Fix all random seeds so results are reproducible across runs.
+    # Fix all random seeds so results are reproducible across runs and all of the following three libraries:
     torch.manual_seed(args.rand_seed)
     random.seed(args.rand_seed)
     np.random.seed(args.rand_seed)
 
     # Use GPU if available, otherwise fall back to CPU.
     device = torch.device("cuda" if torch.cuda.is_available() else torch.device("cpu"))
+    
     print("\n" + "="*60)
-    print("  ATMGNN_Diff Training Run")
+    print("  DiffATMGNN Training Run")
     print("="*60)
     print("  Device             : {}".format(device))
-    print("  Models             : ATMGNN_Diff")
+    print("  Models             : DiffATMGNN")
     print("  Countries          : IT, EN, FR, ES")
     print("  Shifts             : 0 to {}".format(args.ahead - 1))
     print("  Epochs             : {} (early stop after {})".format(args.epochs, args.early_stop))
@@ -222,6 +205,7 @@ if __name__ == '__main__':
     meta_labs, meta_graphs, meta_features, meta_y = read_datasets(args.window, args.rand_weights)
     print("[SETUP] Datasets loaded.\n")
 
+    # Per-country loop
     for country in ["IT", "EN", "FR", "ES"]:
 
         if country == "IT":     # Italy
@@ -233,40 +217,42 @@ if __name__ == '__main__':
         elif country == "FR":   # France
             idx = 3
 
-        # Extract this country's data from the shared meta-lists.
+        # Extract current country's data from the shared meta-lists.
         labels   = meta_labs[idx]
         gs_adj   = meta_graphs[idx]
         features = meta_features[idx]
         y        = meta_y[idx]
-        n_samples = len(gs_adj)                        # total number of days available
-        nfeat     = meta_features[idx][0].shape[1]     # number of input features per node
-
+        n_samples = len(gs_adj)                        
+        nfeat     = meta_features[idx][0].shape[1]     
         n_nodes = gs_adj[0].shape[0]
+        
         print("\n" + "-"*60)
         print("  Country: {}  |  Nodes: {}  |  Days available: {}".format(country, n_nodes, n_samples))
         print("-"*60)
 
-        # Per-node inverse-frequency weights: regions with larger mean case counts receive less
-        # weight so the loss is balanced across all scales.
+        # Big regions have more cases than small regions. Therefore, we correct for this so that the loss would be dominated by big regions.
         mean_cases = labels.values.astype(float).mean(axis=1)  # mean daily cases per region
         inv_weights = 1.0 / (np.log1p(mean_cases) + 1.0)       # inverse of log-scale magnitude
         inv_weights = inv_weights / inv_weights.mean()           # normalise so mean weight = 1
+        # Big region -> high mean_cases -> high log -> small weight -> penalised less
+        # Small region -> low mean_cases  -> low log  -> large weight -> penalised more
         node_weights = torch.FloatTensor(inv_weights).to(device)
 
-        # Create output directories if they don't exist yet.
+        # Create output directories if they don't exist.
         for _dir in ['../results', '../checkpoints', '../predictions', '../figures/training']:
             if not os.path.exists(_dir):
                 os.makedirs(_dir)
 
+        # Per-model loop (kept only to DiffATMGNN for now)
         for args.model in ['ATMGNN_Diff']:
             print("\n[MODEL] Starting training: {} on {}".format(args.model, country))
-            _pred_store = {}           # shift -> (mean_pred_per_day, mean_true_per_day)
+            _pred_store = {}           
 
             # Predicts 0, 1, ..., 'ahead' - 1 days into the future.
             for shift in list(range(0, args.ahead)):
                 print("\n  [SHIFT {}/{}] Model={} Country={}".format(shift + 1, args.ahead, args.model, country))
 
-                # Resume check: skip this shift if all three outputs already exist. ---
+                # Resume check: skip current shift if all three following outputs already exist:
                 _pred_path    = "../predictions/predict_{}_shift{}_{}.csv".format(args.model, shift, country)
                 _truth_path   = "../predictions/truth_{}_shift{}_{}.csv".format(args.model, shift, country)
                 _results_path = "../results/results_{}_temporal.csv".format(country)
@@ -291,7 +277,7 @@ if __name__ == '__main__':
                 print("    Rolling window: {} test days ({} to {})".format(
                     n_test_days, args.start_exp, n_samples - shift - 1))
 
-                # Rolling-window loop: each iteration moves the test day one step forward.
+                # Rolling-window loop: each iteration moves the test day (test_sample) one step (day) forward.
                 for test_sample in range(args.start_exp, n_samples - shift):
                     exp += 1
                     print("    [Day {}/{} | test_sample={}]".format(exp, n_test_days, test_sample),
@@ -299,9 +285,9 @@ if __name__ == '__main__':
 
                     # === DATA SPLITTING ===
                     
-                    idx_train = list(range(args.window - 1, test_sample - args.sep))
-                    idx_val   = list(range(test_sample - args.sep, test_sample, 2))
-                    idx_train = idx_train + list(range(test_sample - args.sep + 1, test_sample, 2))
+                    idx_train = list(range(args.window - 1, test_sample - args.sep))    # Training Set
+                    idx_val   = list(range(test_sample - args.sep, test_sample, 2)) # Validation Set
+                    idx_train = idx_train + list(range(test_sample - args.sep + 1, test_sample, 2)) # Test Set
 
                     # Augment training with time-reversed samples.
                     _augment = True
@@ -349,12 +335,13 @@ if __name__ == '__main__':
                             _dst.update({k: v for k, v in _src.items() if not k.startswith('diffusion.')})
                             model.load_state_dict(_dst)
                 
-                            # Freeze only the heavy GCN backbone; let mix, attention, and fc layers fine-tune alongside the diffusion decoder for better conditioning.
+                            # Freeze the GCN backbone layers so they don't change. Only the attention, mix, and diffusion layers train.
                             _frozen_prefixes = ('bottom_encoder.', 'middle_encoder.', 'middle_linear.')
                             for name, param in model.named_parameters():
                                 if name.startswith(_frozen_prefixes):
                                     param.requires_grad_(False)
 
+                        # Adam Optimizer 
                         optimizer = optim.Adam(
                             filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
                         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5)
@@ -364,6 +351,7 @@ if __name__ == '__main__':
                         test_among_epochs  = []
                         stop               = False
 
+                        # Epoch (Training) Loop
                         for epoch in range(args.epochs):
                             start = time.time()
 
@@ -437,6 +425,7 @@ if __name__ == '__main__':
 
                     # === TESTING ===
 
+                    # Load best saved weights from checkpoint
                     _ckpt_path = '../checkpoints/model_best_{}_shift{}_{}_RW_{}_seed{}_AG.pth.tar'.format(
                         args.model, shift, country, args.rand_weights, args.rand_seed)
                     if not os.path.exists(_ckpt_path):
@@ -453,7 +442,7 @@ if __name__ == '__main__':
                     optimizer.load_state_dict(checkpoint['optimizer'])
                     model.eval()
 
-                    # Point forecast via the deterministic fc head (stable, fast).
+                    # Point forecast 
                     output, loss = test(adj_test[0], features_test[0], y_test[0])
 
                     # Diffusion sampling for uncertainty estimation.
@@ -461,7 +450,7 @@ if __name__ == '__main__':
                     if args.num_samples > 1:
                         with torch.no_grad():
                             diff_samples = model(adj_test[0], features_test[0], n_samples=args.num_samples)
-                            uncertainty = diff_samples.std(dim=0)
+                            uncertainty = diff_samples.std(dim=0)   # Take the standard deviation as uncertainty estimat
 
                     o_log = output.cpu().detach().numpy()
                     l     = y_test[0].cpu().numpy()
